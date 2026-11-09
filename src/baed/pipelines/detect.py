@@ -384,6 +384,123 @@ def train_subgraph_anomaly_detector(detector, generator, gae, train_loader, eval
     return test_subgraph_anomaly_detector(detector, test_loader, device, model_path=model_path)
 
 
+# ---------------------------------------------------------------------------
+# Batched variant (``--batched``). Same graphs, same skip rule, same per-graph
+# forward (dgl.batch + per-graph max readout). Differences vs. the original loop:
+# one optimizer step per mini-batch (mean loss) instead of one per sample, and
+# BAED samples for a batch are generated in a single call.
+# ---------------------------------------------------------------------------
+
+def _to_dgl(feat, edge_index):
+    """Same rule as ``construct_graph``: graphs without edges are skipped (return None)."""
+    if feat.shape[0] == 0 or edge_index.numel() == 0:
+        return None
+    n = int(edge_index.max()) + 1
+    g = dgl.graph((edge_index[0], edge_index[1]), num_nodes=n)
+    g.ndata['feature'] = feat[torch.unique(edge_index)]
+    return g
+
+
+def _batch(feats, edges, labels):
+    graphs, ys, pos = [], [], []
+    for i in range(min(len(feats), len(labels))):
+        g = _to_dgl(feats[i].to(device), edges[i].to(device))
+        if g is not None:
+            graphs.append(g)
+            ys.append(int(labels[i]))
+            pos.append(i)
+    if not graphs:
+        return None, None, pos
+    return dgl.batch(graphs), torch.tensor(ys, device=device), pos
+
+
+def _guidance(gae, feats, edges, labels, losses):
+    """Loss-weighted max-pooled GAE embedding of the anomalous ego-graphs (as in the original loop)."""
+    idx = torch.where(labels == 1)[0].tolist()
+    if not idx:
+        return None
+    embs, w = [], []
+    for j in idx:
+        z = gae.encode(feats[j].to(device, dtype=torch.float), edges[j].to(device))
+        embs.append(torch.max(z, dim=0).values)
+        w.append(losses.get(j, 1.0) if losses else 1.0)
+    w = torch.tensor(w, device=device, dtype=torch.float)
+    w = w / w.sum() if w.sum() > 0 else torch.full_like(w, 1.0 / len(w))
+    return (torch.stack(embs) * w[:, None]).sum(0)
+
+
+@torch.no_grad()
+def test_batched(detector, test_loader, model_path):
+    detector.load_state_dict(torch.load(model_path, map_location=device))
+    detector.eval()
+    ys, probs = [], []
+    for data in test_loader:
+        if not data:
+            continue
+        bg, y, _ = _batch(data.subFeature, data.sub_edge_index, data.sub_label)
+        if bg is None:
+            continue
+        out = detector(bg).reshape(-1, 2)
+        probs.append(F.softmax(out, dim=1)[:, 1].cpu())
+        ys.append(y.cpu())
+    y = torch.cat(ys).numpy()
+    prob = torch.cat(probs).numpy()
+    pred = (prob > 0.5).astype(int)  # == argmax of a 2-class softmax
+    m = {'accuracy': float((pred == y).mean()), 'n_test': int(len(y)), 'n_test_anomaly': int(y.sum())}
+    if len(np.unique(y)) > 1:
+        m.update(auroc=float(roc_auc_score(y, prob)), auprc=float(average_precision_score(y, prob)),
+                 f1_macro=float(f1_score(y, pred, average='macro')), f1_anomaly=float(f1_score(y, pred, pos_label=1)),
+                 classification_report=classification_report(y, pred, digits=5, target_names=["正常", "异常"]))
+    print({k: v for k, v in m.items() if k != 'classification_report'})
+    return m
+
+
+def train_batched(detector, generator, gae, train_loader, test_loader, num_epochs, optimizer, dataset,
+                  use_baed, withcondition, run_tag, eval_loader=None):
+    model_path = str(paths.ensure(paths.root() / "outputs" / "detect_weights" /
+                                  f"{dataset}_{detector.modelName}_{'BAED' if use_baed else 'None'}_{run_tag}.pth"))
+    prev_losses = {}  # batch index -> {position in batch: loss}, used for the guidance weights
+    best = float('inf')
+    for epoch in range(num_epochs):
+        detector.train()
+        tot, cnt = 0.0, 0
+        for b, data in enumerate(tqdm(train_loader, leave=False)):
+            if not data:
+                continue
+            feats, edges, labels = list(data.subFeature), list(data.sub_edge_index), data.sub_label
+            n_norm, n_anom = int((labels == 0).sum()), int((labels == 1).sum())
+            if use_baed and n_anom < n_norm:
+                emb = _guidance(gae, feats, edges, labels, prev_losses.get(b) if epoch else None) if withcondition else None
+                diff = n_norm - n_anom
+                gen = generator.generate_data(diff, embedding=emb)
+                gfeat, gedge = processGenerateSubgraph(gen, feats[0].size(1))
+                feats += gfeat
+                edges += gedge
+                labels = torch.cat((labels, torch.ones(len(gfeat), dtype=torch.long)))
+            bg, y, pos = _batch(feats, edges, labels)
+            if bg is None:
+                continue
+            out = detector(bg).reshape(-1, 2)
+            loss_each = F.cross_entropy(out, y, reduction='none')
+            loss = loss_each.mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            prev_losses[b] = dict(zip(pos, loss_each.detach().cpu().tolist()))
+            tot += float(loss_each.sum())
+            cnt += len(pos)
+        avg = tot / max(cnt, 1)
+        if avg < best:
+            best = avg
+            torch.save(detector.state_dict(), model_path)
+        print(f"Epoch {epoch + 1}: Average Error = {avg}")
+    m = test_batched(detector, test_loader, model_path)
+    if eval_loader is not None:
+        v = test_batched(detector, eval_loader, model_path)
+        m.update({f"val_{k}": v[k] for k in ("auroc", "auprc", "f1_macro") if k in v})
+    return m
+
+
 def build_detector(name, nodes_feats):
     if name == "BWGNN":
         return BWGNN(in_feats=nodes_feats, activation='Sigmoid')
@@ -440,6 +557,8 @@ def run(argv=None):
     parser.add_argument("--dynamic-segments", type=int, default=0,
                         help="K>0: incremental setting (Table 2). Split the time-ordered ego-graphs into K+1 consecutive "
                              "segments, at step T train on segment T (continuing the model) and test on segment T+1")
+    parser.add_argument("--batched", action="store_true",
+                        help="batch the ego-graphs of a mini-batch (dgl.batch): one optimizer step per batch, much faster")
     parser.add_argument("--out", default=None, help="write metrics as JSON here")
     cli = parser.parse_args(argv)
     set_seed(cli.seed)
@@ -458,7 +577,7 @@ def run(argv=None):
 
     detector = build_detector(cli.model, cli.node_feats).to(device)
     optimizer = optim.Adam(detector.parameters(), lr=cli.lr)
-    tag = f"{cli.model}_{'BAED' if cli.use_baed else 'None'}_s{cli.seed}" + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "")
+    tag = f"{cli.model}_{'BAED' if cli.use_baed else 'None'}_s{cli.seed}" + ("_b" if cli.batched else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "")
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
@@ -468,24 +587,28 @@ def run(argv=None):
         print("训练集/验证集/测试集样本数:", [len(x) for x in sets], "train normal:", n0)
         return sets, create_dataloaders(*sets, batch_size, num_workers, pin_memory, collate_fn)
 
+    def train_fn(train_loader, test_loader, run_tag, eval_loader=None):
+        if cli.batched:
+            return train_batched(detector, generator, gae, train_loader, test_loader, cli.epochs, optimizer, dataset,
+                                 cli.use_baed, cli.with_condition, run_tag, eval_loader=eval_loader)
+        return train_subgraph_anomaly_detector(detector, generator, gae, train_loader, None, test_loader, cli.epochs,
+                                               optimizer, device, dataset, use_baed=cli.use_baed,
+                                               withcondition=cli.with_condition, run_tag=run_tag)
+
     t0 = time.time()
     results = {"args": vars(cli), "steps": []}
     if cli.dynamic_segments <= 0:
         train_nx, eval_nx, test_nx = split_dataset(nx_graphs)
         (train_set, _, _), (train_loader, eval_loader, test_loader) = loaders(train_nx, eval_nx, test_nx)
         sample_losses = [[] for _ in range(len(train_set) // batch_size + 1)]
-        m = train_subgraph_anomaly_detector(detector, generator, gae, train_loader, eval_loader, test_loader, cli.epochs,
-                                            optimizer, device, dataset, use_baed=cli.use_baed,
-                                            withcondition=cli.with_condition, run_tag=tag)
+        m = train_fn(train_loader, test_loader, tag, eval_loader=eval_loader)
         results["steps"].append(m)
     else:
         segs = chronological_segments(nx_graphs, cli.dynamic_segments + 1)
         for t in range(1, cli.dynamic_segments + 1):
             (train_set, _, _), (train_loader, eval_loader, test_loader) = loaders(segs[t - 1], segs[t][:1], segs[t])
             sample_losses = [[] for _ in range(len(train_set) // batch_size + 1)]
-            m = train_subgraph_anomaly_detector(detector, generator, gae, train_loader, eval_loader, test_loader, cli.epochs,
-                                                optimizer, device, dataset, use_baed=cli.use_baed,
-                                                withcondition=cli.with_condition, run_tag=f"{tag}_T{t}")
+            m = train_fn(train_loader, test_loader, f"{tag}_T{t}")
             m["T"] = t
             results["steps"].append(m)
             print(f"[dynamic] T={t}: auroc={m.get('auroc')} auprc={m.get('auprc')} f1={m.get('f1_macro')}")

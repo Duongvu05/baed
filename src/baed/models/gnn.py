@@ -12,6 +12,17 @@ import copy
 import numpy as np
 
 
+def graph_max_readout(graph, h):
+    """Max over the nodes of each graph.
+
+    A single graph gives shape [C] (original behaviour, ``torch.max(h, dim=0)``).
+    A ``dgl.batch`` of B graphs gives [B, C], identical to running each graph alone.
+    """
+    if graph.batch_size > 1:
+        return dgl.ops.segment_reduce(graph.batch_num_nodes(), h, "max")
+    return torch.max(h, dim=0).values
+
+
 class PolyConv(nn.Module):
     def __init__(self, theta):
         super(PolyConv, self).__init__()
@@ -93,7 +104,7 @@ class BernNet(nn.Module):
         h = self.bernconv(graph, h)
         h = self.act(h)
         h = self.mlp(h, False)
-        h = torch.max(h,dim=0).values
+        h = graph_max_readout(graph, h)
         return h
 
 
@@ -184,7 +195,7 @@ class BWGNN(nn.Module):
             h_final = torch.cat([h_final, h0], -1)
         h_final = self.dropout(h_final)
         h = self.mlp(h_final, False)
-        h = torch.max(h,dim=0).values
+        h = graph_max_readout(graph, h)
         return h
 
 
@@ -212,7 +223,7 @@ class GCN(nn.Module):
             h = layer(graph, h)
         h = self.mlp(h, False)
         # print("h:",h)
-        h = torch.max(h,dim=0).values
+        h = graph_max_readout(graph, h)
         return h
 
 
@@ -245,7 +256,7 @@ class RGCN(nn.Module):
             # print(graph, h)
             h = layer(graph, h)
         h = self.mlp(h[self.type], False)
-        h = torch.max(h,dim=0).values
+        h = graph_max_readout(graph, h)
         return h
 
 
@@ -298,7 +309,7 @@ class GIN(nn.Module):
             if i != 0:
                 h = self.dropout(h)
             h = layer(graph, h)
-        h = torch.max(h,dim=0).values
+        h = graph_max_readout(graph, h)
         return h
 
 
@@ -360,7 +371,7 @@ class GraphSAGE(nn.Module):
             h = self.dropout(h)
             h = layer(graph, h)
         h = self.output_linear(h)
-        h = torch.max(h,dim=0).values
+        h = graph_max_readout(graph, h)
         return h
 
 
