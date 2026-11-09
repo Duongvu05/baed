@@ -54,6 +54,10 @@ def get_model(args, initial_graph_sampler):
         embedding_dim=32
     elif args.dataset=="dgraph":
         embedding_dim=64
+    elif args.dataset=="reddit":  # matches reddit_gae_relu_128.pt loaded in datasets/data.py
+        embedding_dim=128
+    elif args.dataset=="photo":  # matches photo_gae_relu_896.pt
+        embedding_dim=896
     dynamics = dynamics_fn(
             dataset=args.dataset,
             max_degree=args.max_degree,

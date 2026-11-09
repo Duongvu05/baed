@@ -469,6 +469,11 @@ class TGNN_embedding_guided(torch.nn.Module):
             self.gae=torch.load(str(paths.gae_weight("dgraph_gae_relu_32.pt")))
         elif dataset=="tfinance":
             self.gae=torch.load(str(paths.gae_weight("tfinance_gae_sigmoid_32.pt")))
+        # reddit / photo were commented out upstream (toggled by hand per run)
+        elif dataset=="reddit":
+            self.gae=torch.load(str(paths.gae_weight("reddit_gae_relu_128.pt")))
+        elif dataset=="photo":
+            self.gae=torch.load(str(paths.gae_weight("photo_gae_relu_896.pt")))
         # self.gae= torch.load(str(paths.gae_weight("reddit_gae_relu_128.pt")))
         # self.gae= torch.load(str(paths.gae_weight("photo_gae_relu_896.pt")))
         # self.gae= torch.load(str(paths.gae_weight("tfinance_gae_sigmoid_32.pt")))

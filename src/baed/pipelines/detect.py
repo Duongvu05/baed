@@ -413,6 +413,11 @@ def chronological_segments(items, k):
 
 
 def main(argv=None):
+    """Step 05 entry point (console script). Returns None so the exit code is 0."""
+    run(argv)
+
+
+def run(argv=None):
     """Step 05 - downstream graph anomaly detection (GCN / BernNet / BWGNN / GraphSAGE / GIN)."""
     import argparse
     import json
