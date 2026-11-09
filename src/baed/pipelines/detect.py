@@ -415,16 +415,39 @@ def _to_dgl(feat, edge_index):
 
 
 def _batch(feats, edges, labels):
-    graphs, ys, pos = [], [], []
+    """Build one batched DGL graph directly (edge lists concatenated with node offsets).
+
+    Equivalent to ``dgl.batch([_to_dgl(f, e) ...])`` with the same skip rule, but with a
+    single host->device copy instead of one small graph per ego-graph.
+    """
+    fs, es, ys, pos, nn_, ne_ = [], [], [], [], [], []
+    off = 0
     for i in range(min(len(feats), len(labels))):
-        g = _to_dgl(feats[i].to(device), edges[i].to(device))
-        if g is not None:
-            graphs.append(g)
-            ys.append(int(labels[i]))
-            pos.append(i)
-    if not graphs:
+        f, e = feats[i], edges[i]
+        n = f.shape[0]
+        if n == 0:
+            continue
+        if e.numel() == 0:
+            if not KEEP_ISOLATED:
+                continue
+            e = torch.arange(n).repeat(2, 1)  # self-loops, as in _to_dgl
+        elif int(e.max()) + 1 != n or torch.unique(e).numel() != n:
+            continue  # construct_graph would fail on such a graph (never happens for ego-graphs)
+        fs.append(f)
+        es.append(e + off)
+        nn_.append(n)
+        ne_.append(e.size(1))
+        ys.append(int(labels[i]))
+        pos.append(i)
+        off += n
+    if not fs:
         return None, None, pos
-    return dgl.batch(graphs), torch.tensor(ys, device=device), pos
+    e = torch.cat(es, 1).to(device)
+    g = dgl.graph((e[0], e[1]), num_nodes=off)
+    g.set_batch_num_nodes(torch.tensor(nn_, device=device))
+    g.set_batch_num_edges(torch.tensor(ne_, device=device))
+    g.ndata['feature'] = torch.cat(fs).to(device)
+    return g, torch.tensor(ys, device=device), pos
 
 
 def _guidance(gae, feats, edges, labels, losses):
@@ -586,7 +609,14 @@ def run(argv=None):
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     gae = torch.load(str(paths.gae_weight(cli.gae_weight or f'{dataset}_gae_relu_128.pt')), map_location=device)
     dataset_path = str(paths.graph_file(f"{dataset}_init_0_1_dataset.pkl"))
-    nx_graphs = load_dataset(dataset_path)
+    if cli.batched:
+        from baed.datasets.lean import keep, lean_collate, load_lean
+
+        nx_graphs = load_lean(dataset_path, lambda: load_dataset(dataset_path), paths.root() / "data" / "cache")
+        label_of = lambda it: it[2]  # noqa: E731
+    else:
+        nx_graphs = load_dataset(dataset_path)
+        label_of = lambda g: g.graph["sublabel"]  # noqa: E731
     print("数据集样本总数为:", len(nx_graphs))
 
     generator = None
@@ -602,6 +632,11 @@ def run(argv=None):
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
     def loaders(train_nx, eval_nx, test_nx):
+        if cli.batched:
+            sets = [[it for it in x if keep(it, cli.keep_isolated)] for x in (train_nx, eval_nx, test_nx)]
+            print("训练集/验证集/测试集样本数:", [len(x) for x in sets], "train anomalies:", sum(it[2] for it in sets[0]))
+            dl = [DataLoader(x, batch_size=batch_size, shuffle=(k == 0), collate_fn=lean_collate) for k, x in enumerate(sets)]
+            return sets, dl
         sets = [GraphDataset(preprocessDataset(x)) for x in (train_nx, eval_nx, test_nx)]
         n0 = sum(int(d.sub_label == 0) for d in sets[0].pyg_datas) if hasattr(sets[0], "pyg_datas") else None
         print("训练集/验证集/测试集样本数:", [len(x) for x in sets], "train normal:", n0)
@@ -619,7 +654,7 @@ def run(argv=None):
     results = {"args": vars(cli), "steps": []}
     if cli.dynamic_segments <= 0:
         if cli.split == "random":
-            y = [g.graph["sublabel"] for g in nx_graphs]
+            y = [label_of(g) for g in nx_graphs]
             idx = np.arange(len(nx_graphs))
             tr, rest = train_test_split(idx, train_size=0.7, stratify=y, random_state=cli.seed)
             va, te = train_test_split(rest, test_size=0.5, stratify=[y[i] for i in rest], random_state=cli.seed)

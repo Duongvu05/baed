@@ -86,3 +86,20 @@ def test_center_labels_used_for_sublabel():
     )
     assert gs[0].graph["sublabel"] == 1
     assert torch.equal(gs[0].nodes[0]["label"], torch.tensor([0, 1]))
+
+
+def test_lean_convert_matches_from_networkx():
+    import torch_geometric as pyg
+
+    from baed.datasets.lean import convert
+
+    src, dst, n = random_graph(n=120, m=300, seed=3)
+    _, g = reference(src, dst, n, [0], 1)
+    gs = graph_ops.build_ego_graphs(src, dst, n, g.ndata["feature"], g.ndata["label"], range(0, n, 5), 2, backend="python")
+    for G in gs:
+        feat, ei, y = convert(G)
+        d = pyg.utils.from_networkx(G)
+        assert torch.equal(feat, d.feature)
+        assert {tuple(e) for e in ei.t().tolist()} == {tuple(e) for e in d.edge_index.t().tolist()}
+        assert ei.size(1) == d.edge_index.size(1)
+        assert y == G.graph["sublabel"]

@@ -30,3 +30,19 @@ def test_batched_equals_single(cls):
         single = torch.stack([model(g) for g in gs])
         batched = model(dgl.batch(gs))
     torch.testing.assert_close(batched, single, rtol=1e-5, atol=1e-6)
+
+
+def test_offset_batch_equals_dgl_batch():
+    from baed.pipelines import detect
+
+    gs = graphs(n=7)
+    feats = [g.ndata["feature"] for g in gs]
+    edges = [torch.stack(g.edges()) for g in gs]
+    labels = torch.tensor([k % 2 for k in range(len(gs))])
+    bg, y, pos = detect._batch(feats, edges, labels)
+    torch.manual_seed(0)
+    model = GCN(in_feats=5).eval()
+    with torch.no_grad():
+        torch.testing.assert_close(model(bg.cpu()), model(dgl.batch(gs)), rtol=1e-5, atol=1e-6)
+    assert pos == list(range(len(gs)))
+    assert y.tolist() == labels.tolist()
