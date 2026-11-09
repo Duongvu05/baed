@@ -43,7 +43,7 @@ from baed.pipelines.generate import GraphDataGenerator, GenerateDataArgs
 import torch.multiprocessing
 from sklearn.preprocessing import label_binarize
 
-from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve, auc, classification_report
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve, auc, classification_report, f1_score
 import random
 import copy
 
@@ -194,10 +194,15 @@ def test_subgraph_anomaly_detector(detector, test_loader, device, model_path):
         auroc = roc_auc_score(all_labels, all_probs)
         auprc = average_precision_score(all_labels, all_probs)
         report = classification_report(all_labels, all_predicted, digits=5, target_names=["正常", "异常"])
+        f1_macro = f1_score(all_labels, all_predicted, average='macro')
 
         metrics.update({
-            'auroc': auroc,
-            'auprc': auprc,
+            'auroc': float(auroc),
+            'auprc': float(auprc),
+            'f1_macro': float(f1_macro),
+            'f1_anomaly': float(f1_score(all_labels, all_predicted, pos_label=1)),
+            'n_test': int(len(all_labels)),
+            'n_test_anomaly': int(all_labels.sum()),
             'classification_report': report
         })
 
@@ -211,7 +216,7 @@ def test_subgraph_anomaly_detector(detector, test_loader, device, model_path):
 
 # 训练模型
 def train_subgraph_anomaly_detector(detector, generator, gae, train_loader, eval_loader, test_loader, num_epochs,
-                                    optimizer, device, dataset, use_baed=True,withcondition=True):
+                                    optimizer, device, dataset, use_baed=True,withcondition=True, run_tag="run"):
     """ Train a subgraph anomaly detection model.
     Parameters:
     detector (torch.nn.Module): The anomaly detection model.
@@ -231,7 +236,7 @@ def train_subgraph_anomaly_detector(detector, generator, gae, train_loader, eval
         generatorName = "BAED"
     else:
         generatorName = "None"
-    model_path = f"./subgraphWeight/{dataset}_{detector.modelName}_{generatorName}.pth"
+    model_path = str(paths.ensure(paths.root() / "outputs" / "detect_weights" / f"{dataset}_{detector.modelName}_{generatorName}_{run_tag}.pth"))
     # 训练集训练+验证集验证
 
     for epoch in range(num_epochs):
@@ -376,12 +381,42 @@ def train_subgraph_anomaly_detector(detector, generator, gae, train_loader, eval
         # avg_eval_loss = eval_loss / num_eval_samples
         # print(f"Epoch {epoch+1}: Validation Loss = {avg_eval_loss}")
         # 测试集测试：
-        test_subgraph_anomaly_detector(detector, test_loader, device, model_path=model_path)
+    return test_subgraph_anomaly_detector(detector, test_loader, device, model_path=model_path)
+
+
+def build_detector(name, nodes_feats):
+    if name == "BWGNN":
+        return BWGNN(in_feats=nodes_feats, activation='Sigmoid')
+    if name == "BernNet":
+        return BernNet(in_feats=nodes_feats, activation='Sigmoid')
+    if name == "GCN":
+        return GCN(in_feats=nodes_feats)
+    if name == "GIN":
+        return GIN(in_feats=nodes_feats)
+    if name == "GraphSAGE":
+        return GraphSAGE(in_feats=nodes_feats)
+    raise ValueError(name)
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def chronological_segments(items, k):
+    """Split an ordered list into k consecutive, (almost) equal chunks."""
+    n = len(items)
+    bounds = [round(j * n / k) for j in range(k + 1)]
+    return [items[bounds[j]:bounds[j + 1]] for j in range(k)]
 
 
 def main(argv=None):
     """Step 05 - downstream graph anomaly detection (GCN / BernNet / BWGNN / GraphSAGE / GIN)."""
     import argparse
+    import json
+    import time
 
     global device, sample_losses
     parser = argparse.ArgumentParser(description=main.__doc__)
@@ -392,93 +427,70 @@ def main(argv=None):
     parser.add_argument("--node-feats", type=int, default=64)
     parser.add_argument("--gae-weight", default=None, help="file name under weights/gae/ (default <dataset>_gae_relu_128.pt)")
     parser.add_argument("--use-baed", action="store_true", help="augment training with BAED-generated anomalous ego-graphs")
-    parser.add_argument("--with-condition", action="store_true")
+    parser.add_argument("--with-condition", action="store_true", help="anomaly-guided generation (guidance embedding)")
     parser.add_argument("--run-name", default="2024-12-06_17-50-36", help="BAED run used when --use-baed")
     parser.add_argument("--checkpoint", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--dynamic-segments", type=int, default=0,
+                        help="K>0: incremental setting (Table 2). Split the time-ordered ego-graphs into K+1 consecutive "
+                             "segments, at step T train on segment T (continuing the model) and test on segment T+1")
+    parser.add_argument("--out", default=None, help="write metrics as JSON here")
     cli = parser.parse_args(argv)
+    set_seed(cli.seed)
     dataset = cli.dataset
-    gae = torch.load(str(paths.gae_weight(cli.gae_weight or f'{dataset}_gae_relu_128.pt')))
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    gae = torch.load(str(paths.gae_weight(cli.gae_weight or f'{dataset}_gae_relu_128.pt')), map_location=device)
     dataset_path = str(paths.graph_file(f"{dataset}_init_0_1_dataset.pkl"))
     nx_graphs = load_dataset(dataset_path)
     print("数据集样本总数为:", len(nx_graphs))
-    train_nx_graphs, eval_nx_graphs, test_nx_graphs = split_dataset(nx_graphs)
-    # 子图样本集预处理，并构建dataset
-    train_pygraphs, eval_pygraphs, test_pygraphs = preprocessDataset(train_nx_graphs), preprocessDataset(eval_nx_graphs), preprocessDataset(test_nx_graphs)
 
-    # 初始化计数器和索引列表
-    label_0_count = 0
-    label_1_count = 0
-    label_1_indices = []
+    generator = None
+    if cli.use_baed:
+        gen_args = GenerateDataArgs(run_name=cli.run_name, dataset=dataset, num_samples=64, seed=cli.seed, checkpoint=cli.checkpoint)
+        generator = GraphDataGenerator(gen_args)
+        set_seed(cli.seed)  # the generator setup consumes RNG state
 
-    # 遍历 train_pygraphs 提取标签并统计数量
-    for idx, pyg_data in enumerate(train_pygraphs):
-        if pyg_data.sub_label == 0:
-            label_0_count += 1
-        elif pyg_data.sub_label == 1:
-            label_1_count += 1
-            label_1_indices.append(idx)
+    detector = build_detector(cli.model, cli.node_feats).to(device)
+    optimizer = optim.Adam(detector.parameters(), lr=cli.lr)
+    tag = f"{cli.model}_{'BAED' if cli.use_baed else 'None'}_s{cli.seed}" + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "")
+    batch_size, num_workers, pin_memory = cli.batch_size, 0, True
+    print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
-    # 打印标签数量
-    print(f"标签为 0 的样本数量: {label_0_count}")
-    print(f"标签为 1 的样本数量: {label_1_count}")
+    def loaders(train_nx, eval_nx, test_nx):
+        sets = [GraphDataset(preprocessDataset(x)) for x in (train_nx, eval_nx, test_nx)]
+        n0 = sum(int(d.sub_label == 0) for d in sets[0].pyg_datas) if hasattr(sets[0], "pyg_datas") else None
+        print("训练集/验证集/测试集样本数:", [len(x) for x in sets], "train normal:", n0)
+        return sets, create_dataloaders(*sets, batch_size, num_workers, pin_memory, collate_fn)
 
-    print("训练集样本数:", len(train_pygraphs))
-    print("验证集样本数:", len(eval_pygraphs))
-    print("测试集样本数:", len(test_pygraphs))
-    # 构建dataset
-    train_set = GraphDataset(train_pygraphs)
-    eval_set = GraphDataset(eval_pygraphs)
-    test_set = GraphDataset(test_pygraphs)
-
-    # 修改：设置GPU训练相关参数
-    batch_size, num_workers, pin_memory = 128, 0, True
-
-    # 构建dataloader
-    train_loader, eval_loader, test_loader = create_dataloaders(train_set, eval_set, test_set, batch_size, num_workers,
-                                                                pin_memory, collate_fn)
-
-    # 修改节点特征数目
-    nodes_feats = cli.node_feats
-    embedding_dim = 128
-    # 修改构建模型训练参数
-    num_epochs = cli.epochs
-    learning_rate = cli.lr
-
-    # 修改构建模型
-    subModelName = cli.model
-    if subModelName == "BWGNN":
-        detector = BWGNN(in_feats=nodes_feats,activation='Sigmoid')
-    elif subModelName == "BernNet":
-        detector = BernNet(in_feats=nodes_feats,activation='Sigmoid')
-    # 报错
-    elif subModelName == "AMNet":
-        detector = AMNet(in_feats=nodes_feats)
-    elif subModelName == "GCN":
-        detector = GCN(in_feats=nodes_feats)
-    elif subModelName == "GIN":
-        detector = GIN(in_feats=nodes_feats)
-    elif subModelName == "GraphSAGE":
-        detector = GraphSAGE(in_feats=nodes_feats)
-    detector = detector.to(device)
-    # 构建优化器
-    optimizer = optim.Adam(detector.parameters(), lr=learning_rate)
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-    # 初始化gae模型
-    # gae = torch.load(f./gae/weight/{dataset}_gae_relu_256.pt')
-    use_baed = cli.use_baed
-    withcondition = cli.with_condition
-    # 初始化BAED
-    if use_baed:
-        args = GenerateDataArgs(run_name=cli.run_name, dataset=dataset, num_samples=64, seed=0, checkpoint=cli.checkpoint)
-        generator = GraphDataGenerator(args)
+    t0 = time.time()
+    results = {"args": vars(cli), "steps": []}
+    if cli.dynamic_segments <= 0:
+        train_nx, eval_nx, test_nx = split_dataset(nx_graphs)
+        (train_set, _, _), (train_loader, eval_loader, test_loader) = loaders(train_nx, eval_nx, test_nx)
+        sample_losses = [[] for _ in range(len(train_set) // batch_size + 1)]
+        m = train_subgraph_anomaly_detector(detector, generator, gae, train_loader, eval_loader, test_loader, cli.epochs,
+                                            optimizer, device, dataset, use_baed=cli.use_baed,
+                                            withcondition=cli.with_condition, run_tag=tag)
+        results["steps"].append(m)
     else:
-        generator = None
-    # 训练模型
-    print("epoch:{};lr:{}".format(num_epochs, learning_rate))
-    sample_losses = [[] for i in range(len(train_set) // batch_size + 1)]
-    train_subgraph_anomaly_detector(detector, generator, gae, train_loader, eval_loader, test_loader, num_epochs,
-                                    optimizer, device, dataset, use_baed=use_baed,withcondition=withcondition)
+        segs = chronological_segments(nx_graphs, cli.dynamic_segments + 1)
+        for t in range(1, cli.dynamic_segments + 1):
+            (train_set, _, _), (train_loader, eval_loader, test_loader) = loaders(segs[t - 1], segs[t][:1], segs[t])
+            sample_losses = [[] for _ in range(len(train_set) // batch_size + 1)]
+            m = train_subgraph_anomaly_detector(detector, generator, gae, train_loader, eval_loader, test_loader, cli.epochs,
+                                                optimizer, device, dataset, use_baed=cli.use_baed,
+                                                withcondition=cli.with_condition, run_tag=f"{tag}_T{t}")
+            m["T"] = t
+            results["steps"].append(m)
+            print(f"[dynamic] T={t}: auroc={m.get('auroc')} auprc={m.get('auprc')} f1={m.get('f1_macro')}")
+    results["elapsed_s"] = time.time() - t0
+    if cli.out:
+        out = paths.ensure(paths.root() / cli.out) if not os.path.isabs(cli.out) else cli.out
+        with open(out, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        print("saved:", out)
+    return results
 
 
 if __name__ == "__main__":
