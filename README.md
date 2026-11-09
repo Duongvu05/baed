@@ -82,7 +82,7 @@ Every step has `--help`. Defaults reproduce the values hard-coded in the origina
 | Downstream epochs | 50 | 10 (`trainSubgraphModel.py`) | pass `--epochs 50` |
 | Downstream LR | tuned in 1e-3 ... 1e-6 | 1e-4 | `--lr` |
 | Split | 70 / 15 / 15 | 70 / 15 / 15 (sequential, no shuffle) | same |
-| Seeds | 15, 42, 63, 87, 94 | 0 | `--seed` |
+| Seeds | 15, 42, 63, 87, 94 | 0 | `baed-train --seed` (detect has no seed option yet) |
 
 LR is constant and early stopping is disabled in `diffusion/base.py`, so the epoch-300 checkpoint
 of a longer run equals a 300-epoch run.
