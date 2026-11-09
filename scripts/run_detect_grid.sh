@@ -21,10 +21,11 @@ for m in $MODELS; do for s in $SEEDS; do
   [ -n "${RANDSPLIT:-}" ] && extra+=(--split random)
   [ -n "${ISO:-}" ] && extra+=(--keep-isolated)
   [ -n "${DATATAG:-}" ] && extra+=(--data-tag "$DATATAG")
-  out=outputs/results/$DS/${m}_${MODE}${DATATAG}${BATCHED:+_b}${RANDSPLIT:+_rand}${ISO:+_iso}${LR:+_lr$LR}_s${s}.json
+  [ -n "${PAUG:-}" ] && extra+=(--gen-noise 1.0 --curriculum sigmoid)
+  out=outputs/results/$DS/${m}_${MODE}${DATATAG}${BATCHED:+_b}${RANDSPLIT:+_rand}${ISO:+_iso}${PAUG:+_paug}${LR:+_lr$LR}_s${s}.json
   [ -s "$out" ] && continue
   OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 DGLBACKEND=pytorch nohup uv run baed-detect --dataset "$DS" --model "$m" \
     --node-feats "$NF" --gae-weight "$GAE" --epochs "$EPOCHS" --seed "$s" --out "$out" "${extra[@]}" \
-    > outputs/logs/$DS/${m}_${MODE}${DATATAG}${BATCHED:+_b}${RANDSPLIT:+_rand}${ISO:+_iso}${LR:+_lr$LR}_s${s}.log 2>&1 < /dev/null &
+    > outputs/logs/$DS/${m}_${MODE}${DATATAG}${BATCHED:+_b}${RANDSPLIT:+_rand}${ISO:+_iso}${PAUG:+_paug}${LR:+_lr$LR}_s${s}.log 2>&1 < /dev/null &
 done; done
 wait

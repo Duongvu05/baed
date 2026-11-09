@@ -63,6 +63,8 @@ def add_data_args(parser):
     parser.add_argument('--empty_graph_sampler', type=str, default='empirical', help='empirical | neural') 
     parser.add_argument('--degree', action='store_true')
     parser.add_argument('--augmented_features', type=str, nargs="*", default=[])
+    # ego-graph file suffix: data/graphs/<dataset><data_tag>_init_1_dataset.pkl (e.g. _fulltrain)
+    parser.add_argument('--data_tag', type=str, default='')
 
 def get_data_id(args):
     return '{}'.format(args.dataset)
@@ -131,7 +133,7 @@ def get_data(args):
         num_node_classes = None
         num_edge_classes = 2
         num_node_feat = None
-        nx_graphs = pkl.load(open(str(paths.graph_file(f"{args.dataset}_init_1_dataset.pkl")), 'rb'))
+        nx_graphs = pkl.load(open(str(paths.graph_file(f"{args.dataset}{getattr(args, 'data_tag', '')}_init_1_dataset.pkl")), 'rb'))
         random.shuffle(nx_graphs)
         l = len(nx_graphs)
         train_nx_graphs = nx_graphs[:int(0.8*l)]

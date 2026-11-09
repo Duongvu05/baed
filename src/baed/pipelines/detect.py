@@ -392,6 +392,7 @@ def train_subgraph_anomaly_detector(detector, generator, gae, train_loader, eval
 # ---------------------------------------------------------------------------
 
 KEEP_ISOLATED = False  # set by --keep-isolated
+AUG = {"gen_noise": 0.0, "curriculum": "linear", "alpha": 1.0, "beta": None, "progress": 1.0}  # set by the CLI
 
 
 def _to_dgl(feat, edge_index):
@@ -461,6 +462,11 @@ def _guidance(gae, feats, edges, labels, losses):
         embs.append(torch.max(z, dim=0).values)
         w.append(losses.get(j, 1.0) if losses else 1.0)
     w = torch.tensor(w, device=device, dtype=torch.float)
+    if AUG["curriculum"] == "sigmoid" and losses:
+        # paper Eq. 17: w_i = sigmoid(alpha (l_i - beta)) * t/T  (alpha, beta not given in the paper;
+        # default beta = mean anomaly loss of the batch). t/T cancels after the normalisation of Eq. 18.
+        beta = AUG["beta"] if AUG["beta"] is not None else float(w.mean())
+        w = torch.sigmoid(AUG["alpha"] * (w - beta)) * AUG["progress"]
     w = w / w.sum() if w.sum() > 0 else torch.full_like(w, 1.0 / len(w))
     return (torch.stack(embs) * w[:, None]).sum(0)
 
@@ -498,6 +504,7 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
     prev_losses = {}  # batch index -> {position in batch: loss}, used for the guidance weights
     best = float('inf')
     for epoch in range(num_epochs):
+        AUG["progress"] = (epoch + 1) / num_epochs
         detector.train()
         tot, cnt = 0.0, 0
         for b, data in enumerate(tqdm(train_loader, leave=False)):
@@ -509,6 +516,8 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
                 emb = _guidance(gae, feats, edges, labels, prev_losses.get(b) if epoch else None) if withcondition else None
                 diff = n_norm - n_anom
                 gfeat, gedge = generator.generate_arrays(diff, feats[0].size(1), embedding=emb)
+                if AUG["gen_noise"] > 0:  # paper: synthetic features = original values + N(0, 1)
+                    gfeat = [f.float() + AUG["gen_noise"] * torch.randn(f.shape) for f in gfeat]
                 feats += gfeat
                 edges += gedge
                 labels = torch.cat((labels, torch.ones(len(gfeat), dtype=torch.long)))
@@ -598,11 +607,18 @@ def run(argv=None):
                         help="(--batched only) keep ego-graphs without edges instead of skipping them")
     parser.add_argument("--batched", action="store_true",
                         help="batch the ego-graphs of a mini-batch (dgl.batch): one optimizer step per batch, much faster")
+    parser.add_argument("--gen-noise", type=float, default=0.0,
+                        help="(--batched) add gen_noise * N(0,1) to synthetic node features (paper: 1.0)")
+    parser.add_argument("--curriculum", default="linear", choices=["linear", "sigmoid"],
+                        help="(--batched) guidance weights: linear = released code (loss / sum), sigmoid = paper Eq. 17")
+    parser.add_argument("--cur-alpha", type=float, default=1.0)
+    parser.add_argument("--cur-beta", type=float, default=None, help="default: mean anomaly loss of the batch")
     parser.add_argument("--data-tag", default="", help="ego-graph file suffix, e.g. _full -> <dataset>_full_init_0_1_dataset.pkl")
     parser.add_argument("--out", default=None, help="write metrics as JSON here")
     cli = parser.parse_args(argv)
     global KEEP_ISOLATED
     KEEP_ISOLATED = cli.keep_isolated
+    AUG.update(gen_noise=cli.gen_noise, curriculum=cli.curriculum, alpha=cli.cur_alpha, beta=cli.cur_beta)
     if cli.keep_isolated and not cli.batched:
         parser.error("--keep-isolated requires --batched")
     set_seed(cli.seed)
@@ -628,7 +644,7 @@ def run(argv=None):
 
     detector = build_detector(cli.model, cli.node_feats).to(device)
     optimizer = optim.Adam(detector.parameters(), lr=cli.lr)
-    tag = f"{cli.model}_{'BAED' if cli.use_baed else 'None'}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "")
+    tag = f"{cli.model}_{'BAED' if cli.use_baed else 'None'}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "")
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
