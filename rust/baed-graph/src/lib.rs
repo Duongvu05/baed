@@ -2,6 +2,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+pub mod cc;
 pub mod ego;
 
 type EgoOut<'py> = (
@@ -72,6 +73,33 @@ fn ego_subgraphs<'py>(
     ))
 }
 
+/// Largest connected component of every graph in a PyG-style batch.
+///
+/// `node_ptr` (B+1) delimits the nodes of each graph, `src`/`dst` are global edge ids.
+/// Returns (nodes, node_ptr, edges[2*E] local ids, edge_ptr) - see `cc.rs` for the exact semantics.
+#[pyfunction]
+fn largest_components<'py>(
+    py: Python<'py>,
+    node_ptr: PyReadonlyArray1<'py, i64>,
+    src: PyReadonlyArray1<'py, i64>,
+    dst: PyReadonlyArray1<'py, i64>,
+) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
+    let node_ptr = node_ptr.as_slice()?;
+    let src = src.as_slice()?;
+    let dst = dst.as_slice()?;
+    let n = *node_ptr.last().unwrap_or(&0);
+    if src.len() != dst.len() || src.iter().chain(dst.iter()).any(|&x| x < 0 || x >= n) {
+        return Err(PyValueError::new_err("bad edge list"));
+    }
+    let o = py.detach(|| cc::largest_components(node_ptr, src, dst));
+    let mut flat = Vec::with_capacity(o.edges.len() * 2);
+    for (u, v) in o.edges {
+        flat.push(u);
+        flat.push(v);
+    }
+    Ok((o.nodes.into_pyarray(py), o.node_ptr.into_pyarray(py), flat.into_pyarray(py), o.edge_ptr.into_pyarray(py)))
+}
+
 /// Number of rayon worker threads (set RAYON_NUM_THREADS to change it).
 #[pyfunction]
 fn num_threads() -> usize {
@@ -81,6 +109,7 @@ fn num_threads() -> usize {
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ego_subgraphs, m)?)?;
+    m.add_function(wrap_pyfunction!(largest_components, m)?)?;
     m.add_function(wrap_pyfunction!(num_threads, m)?)?;
     Ok(())
 }

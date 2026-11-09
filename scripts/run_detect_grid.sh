@@ -18,10 +18,12 @@ for m in $MODELS; do for s in $SEEDS; do
   case $MODE in dyn_*) extra+=(--dynamic-segments 4);; esac
   [ -n "${BATCHED:-}" ] && extra+=(--batched)
   [ -n "${LR:-}" ] && extra+=(--lr "$LR")
-  out=outputs/results/$DS/${m}_${MODE}${BATCHED:+_b}${LR:+_lr$LR}_s${s}.json
+  [ -n "${RANDSPLIT:-}" ] && extra+=(--split random)
+  [ -n "${ISO:-}" ] && extra+=(--keep-isolated)
+  out=outputs/results/$DS/${m}_${MODE}${BATCHED:+_b}${RANDSPLIT:+_rand}${ISO:+_iso}${LR:+_lr$LR}_s${s}.json
   [ -s "$out" ] && continue
   OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 DGLBACKEND=pytorch nohup uv run baed-detect --dataset "$DS" --model "$m" \
     --node-feats "$NF" --gae-weight "$GAE" --epochs "$EPOCHS" --seed "$s" --out "$out" "${extra[@]}" \
-    > outputs/logs/$DS/${m}_${MODE}${BATCHED:+_b}${LR:+_lr$LR}_s${s}.log 2>&1 < /dev/null &
+    > outputs/logs/$DS/${m}_${MODE}${BATCHED:+_b}${RANDSPLIT:+_rand}${ISO:+_iso}${LR:+_lr$LR}_s${s}.log 2>&1 < /dev/null &
 done; done
 wait

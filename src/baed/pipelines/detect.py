@@ -391,10 +391,23 @@ def train_subgraph_anomaly_detector(detector, generator, gae, train_loader, eval
 # BAED samples for a batch are generated in a single call.
 # ---------------------------------------------------------------------------
 
+KEEP_ISOLATED = False  # set by --keep-isolated
+
+
 def _to_dgl(feat, edge_index):
-    """Same rule as ``construct_graph``: graphs without edges are skipped (return None)."""
-    if feat.shape[0] == 0 or edge_index.numel() == 0:
+    """Same rule as ``construct_graph``: graphs without edges are skipped (return None).
+
+    With ``--keep-isolated`` an edgeless ego-graph is kept as its nodes plus self-loops
+    (GraphConv rejects zero in-degree nodes).
+    """
+    if feat.shape[0] == 0:
         return None
+    if edge_index.numel() == 0:
+        if not KEEP_ISOLATED:
+            return None
+        g = dgl.add_self_loop(dgl.graph(([], []), num_nodes=feat.shape[0], device=feat.device))
+        g.ndata['feature'] = feat
+        return g
     n = int(edge_index.max()) + 1
     g = dgl.graph((edge_index[0], edge_index[1]), num_nodes=n)
     g.ndata['feature'] = feat[torch.unique(edge_index)]
@@ -472,8 +485,7 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
             if use_baed and n_anom < n_norm:
                 emb = _guidance(gae, feats, edges, labels, prev_losses.get(b) if epoch else None) if withcondition else None
                 diff = n_norm - n_anom
-                gen = generator.generate_data(diff, embedding=emb)
-                gfeat, gedge = processGenerateSubgraph(gen, feats[0].size(1))
+                gfeat, gedge = generator.generate_arrays(diff, feats[0].size(1), embedding=emb)
                 feats += gfeat
                 edges += gedge
                 labels = torch.cat((labels, torch.ones(len(gfeat), dtype=torch.long)))
@@ -557,10 +569,18 @@ def run(argv=None):
     parser.add_argument("--dynamic-segments", type=int, default=0,
                         help="K>0: incremental setting (Table 2). Split the time-ordered ego-graphs into K+1 consecutive "
                              "segments, at step T train on segment T (continuing the model) and test on segment T+1")
+    parser.add_argument("--split", default="sequential", choices=["sequential", "random"],
+                        help="sequential = original code (no shuffle); random = stratified 70/15/15 with --seed")
+    parser.add_argument("--keep-isolated", action="store_true",
+                        help="(--batched only) keep ego-graphs without edges instead of skipping them")
     parser.add_argument("--batched", action="store_true",
                         help="batch the ego-graphs of a mini-batch (dgl.batch): one optimizer step per batch, much faster")
     parser.add_argument("--out", default=None, help="write metrics as JSON here")
     cli = parser.parse_args(argv)
+    global KEEP_ISOLATED
+    KEEP_ISOLATED = cli.keep_isolated
+    if cli.keep_isolated and not cli.batched:
+        parser.error("--keep-isolated requires --batched")
     set_seed(cli.seed)
     dataset = cli.dataset
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -577,7 +597,7 @@ def run(argv=None):
 
     detector = build_detector(cli.model, cli.node_feats).to(device)
     optimizer = optim.Adam(detector.parameters(), lr=cli.lr)
-    tag = f"{cli.model}_{'BAED' if cli.use_baed else 'None'}_s{cli.seed}" + ("_b" if cli.batched else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "")
+    tag = f"{cli.model}_{'BAED' if cli.use_baed else 'None'}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "")
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
@@ -598,7 +618,14 @@ def run(argv=None):
     t0 = time.time()
     results = {"args": vars(cli), "steps": []}
     if cli.dynamic_segments <= 0:
-        train_nx, eval_nx, test_nx = split_dataset(nx_graphs)
+        if cli.split == "random":
+            y = [g.graph["sublabel"] for g in nx_graphs]
+            idx = np.arange(len(nx_graphs))
+            tr, rest = train_test_split(idx, train_size=0.7, stratify=y, random_state=cli.seed)
+            va, te = train_test_split(rest, test_size=0.5, stratify=[y[i] for i in rest], random_state=cli.seed)
+            train_nx, eval_nx, test_nx = ([nx_graphs[i] for i in part] for part in (tr, va, te))
+        else:
+            train_nx, eval_nx, test_nx = split_dataset(nx_graphs)
         (train_set, _, _), (train_loader, eval_loader, test_loader) = loaders(train_nx, eval_nx, test_nx)
         sample_losses = [[] for _ in range(len(train_set) // batch_size + 1)]
         m = train_fn(train_loader, test_loader, tag, eval_loader=eval_loader)

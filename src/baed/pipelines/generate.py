@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import pickle
 import argparse
@@ -70,7 +71,40 @@ class GraphDataGenerator:
             generated_nxgraphs.append(g_gen)
         
         return generated_nxgraphs
+
+    def generate_arrays(self, num_samples, feature_num, embedding=None):
+        """Same samples as ``generate_data`` but returned as tensors (see ``postprocess_batch``)."""
+        return postprocess_batch(self.model.sample(num_samples, embedding), feature_num)
     
+
+def postprocess_batch(batch, feature_num):
+    """Fast equivalent of ``generate_data`` + ``utils.processGenerateSubgraph``.
+
+    Takes the sampled PyG batch, keeps the largest connected component of every graph
+    (Rust kernel ``baed_graph.largest_components``) and returns ``(feats, edge_indices)``:
+    lists of ``[k, feature_num]`` tensors and ``[2, E]`` long tensors, without the
+    pyg -> networkx -> pyg round trip (which deep-copies every node attribute).
+    Same graphs as the original path up to a permutation of nodes inside a graph.
+    """
+    from baed_graph import largest_components
+
+    n = batch.num_nodes
+    if hasattr(batch, "ptr") and batch.ptr is not None:
+        ptr = batch.ptr.cpu().numpy().astype("int64")
+    else:
+        counts = torch.bincount(batch.batch, minlength=batch.num_graphs)
+        ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)]).cpu().numpy().astype("int64")
+    ei = batch.edge_index.cpu().numpy().astype("int64") if batch.edge_index.numel() else np.zeros((2, 0), "int64")
+    nodes, node_ptr, edges, edge_ptr = largest_components(ptr, np.ascontiguousarray(ei[0]), np.ascontiguousarray(ei[1]))
+    x = torch.stack([batch[f"feature{i}"].reshape(n) for i in range(feature_num)], dim=1).cpu()
+    nodes_t = torch.from_numpy(nodes)
+    edges_t = torch.from_numpy(edges).reshape(-1, 2)
+    feats, eidx = [], []
+    for g in range(len(node_ptr) - 1):
+        feats.append(x[nodes_t[node_ptr[g]:node_ptr[g + 1]]])
+        eidx.append(edges_t[edge_ptr[g]:edge_ptr[g + 1]].t().contiguous())
+    return feats, eidx
+
 
 def main(argv=None):
     """Step 04 - synthesize ego-graphs with a trained BAED checkpoint."""
