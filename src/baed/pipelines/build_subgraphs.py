@@ -64,9 +64,9 @@ def select_centers(labels: torch.Tensor, label_type: str) -> list[int]:
     return torch.nonzero(mask, as_tuple=True)[0].tolist()
 
 
-def output_file(dataset: str, label_type: str):
+def output_file(dataset: str, label_type: str, tag: str = ""):
     suffix = "1" if label_type == "label_1" else "0_1"
-    return paths.ensure(paths.graph_file(f"{dataset}_init_{suffix}_dataset.pkl"))
+    return paths.ensure(paths.graph_file(f"{dataset}{tag}_init_{suffix}_dataset.pkl"))
 
 
 def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto"):
@@ -88,7 +88,7 @@ def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto"
     )
 
 
-def build(dataset: str, label_type: str, backend: str = "auto") -> list[nx.Graph]:
+def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False) -> list[nx.Graph]:
     logger.info(f"dataset={dataset} label_type={label_type}")
 
     if dataset == "dgraph":
@@ -103,10 +103,14 @@ def build(dataset: str, label_type: str, backend: str = "auto") -> list[nx.Graph
 
     if dataset == "elliptic":
         nx_graphs = []
-        for step in iter_timesteps(str(paths.graph_file("elliptic_bitcoin_dataset")), 1, 49, node_order="set"):
+        # elliptic_full: use all 49 timesteps (the original loop range(1, 49) with ts + 1 skips
+        # timestep 1) and give the DGL graph all labelled nodes, so no timestep is dropped.
+        start = 0 if elliptic_full else 1
+        for step in iter_timesteps(str(paths.graph_file("elliptic_bitcoin_dataset")), start, 49, node_order="set"):
             if len(step.tx_ids) == 0:
                 continue
-            graph = dgl.graph((torch.from_numpy(step.src), torch.from_numpy(step.dst)))
+            num_nodes = len(step.tx_ids) if elliptic_full else None
+            graph = dgl.graph((torch.from_numpy(step.src), torch.from_numpy(step.dst)), num_nodes=num_nodes)
             node_features = torch.tensor(step.features.values, dtype=torch.float32)
             node_labels = torch.tensor(
                 step.classes["class"].apply(lambda x: 1 if x == "1" else 0).values, dtype=torch.int64
@@ -143,11 +147,11 @@ def build(dataset: str, label_type: str, backend: str = "auto") -> list[nx.Graph
     raise ValueError(f"unsupported dataset: {dataset}")
 
 
-def initOriginDataset(dataset: str, label_type: str, backend: str = "auto") -> None:
+def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False) -> None:
     """Build and save one ego-graph dataset (name kept from the original code)."""
     t0 = time.time()
-    nx_graphs = build(dataset, label_type, backend=backend)
-    out = output_file(dataset, label_type)
+    nx_graphs = build(dataset, label_type, backend=backend, elliptic_full=elliptic_full)
+    out = output_file(dataset, label_type, tag="_full" if elliptic_full else "")
     with open(out, "wb") as f:
         pkl.dump(nx_graphs, f)
     logger.info(f"saved {len(nx_graphs)} ego-graphs to {out} ({time.time() - t0:.1f}s)")
@@ -158,10 +162,14 @@ def main(argv=None):
     parser.add_argument("--dataset", nargs="+", default=DATASETS, choices=DATASETS)
     parser.add_argument("--label-type", nargs="+", default=LABEL_TYPES, choices=LABEL_TYPES)
     parser.add_argument("--backend", default="auto", choices=["auto", "rust", "python"])
+    parser.add_argument("--elliptic-full", action="store_true",
+                        help="Elliptic: keep all 49 timesteps (fixes two quirks of the original code); "
+                             "writes elliptic_full_init_*_dataset.pkl")
     args = parser.parse_args(argv)
     for dataset in args.dataset:
         for label_type in args.label_type:
-            initOriginDataset(dataset, label_type, backend=args.backend)
+            initOriginDataset(dataset, label_type, backend=args.backend,
+                              elliptic_full=args.elliptic_full and dataset == "elliptic")
 
 
 if __name__ == "__main__":

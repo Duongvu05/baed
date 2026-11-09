@@ -598,6 +598,7 @@ def run(argv=None):
                         help="(--batched only) keep ego-graphs without edges instead of skipping them")
     parser.add_argument("--batched", action="store_true",
                         help="batch the ego-graphs of a mini-batch (dgl.batch): one optimizer step per batch, much faster")
+    parser.add_argument("--data-tag", default="", help="ego-graph file suffix, e.g. _full -> <dataset>_full_init_0_1_dataset.pkl")
     parser.add_argument("--out", default=None, help="write metrics as JSON here")
     cli = parser.parse_args(argv)
     global KEEP_ISOLATED
@@ -608,7 +609,7 @@ def run(argv=None):
     dataset = cli.dataset
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     gae = torch.load(str(paths.gae_weight(cli.gae_weight or f'{dataset}_gae_relu_128.pt')), map_location=device)
-    dataset_path = str(paths.graph_file(f"{dataset}_init_0_1_dataset.pkl"))
+    dataset_path = str(paths.graph_file(f"{dataset}{cli.data_tag}_init_0_1_dataset.pkl"))
     if cli.batched:
         from baed.datasets.lean import keep, lean_collate, load_lean
 

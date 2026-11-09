@@ -28,9 +28,17 @@ def main():
     ap.add_argument("--dataset", default="elliptic")
     ap.add_argument("--split", default="sequential", choices=["sequential", "random"])
     ap.add_argument("--seed", type=int, default=15)
+    ap.add_argument("--data-tag", default="")
     a = ap.parse_args()
-    pkl = paths.graph_file(f"{a.dataset}_init_0_1_dataset.pkl")
-    items = load_lean(pkl, lambda: (_ for _ in ()).throw(RuntimeError("build the lean cache first")), paths.root() / "data" / "cache")
+    pkl = paths.graph_file(f"{a.dataset}{a.data_tag}_init_0_1_dataset.pkl")
+
+    def load_nx():
+        import pickle
+
+        with open(pkl, "rb") as f:
+            return pickle.load(f)
+
+    items = load_lean(pkl, load_nx, paths.root() / "data" / "cache")
     n = len(items)
     y = np.array([it[2] for it in items])
     if a.split == "random":
