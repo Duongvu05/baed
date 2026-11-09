@@ -254,6 +254,8 @@ def main(argv=None):
     # NOTE: the released script stopped here and never wrote the file that
     # gae_train expects. We add the edge split + save so the pipeline is runnable.
     data = train_test_split_edges(data, val_ratio=args.val_ratio, test_ratio=args.test_ratio)
+    # dense N x N bool mask (2 GB on elliptic), never read by gae_train
+    del data.train_neg_adj_mask
     out = paths.ensure(paths.gae_data_dir() / f"{args.dataset}_gae.pt")
     torch.save(data, out)
     print("saved:", out)

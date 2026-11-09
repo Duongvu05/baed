@@ -75,6 +75,10 @@ Every step has `--help`. Defaults reproduce the values hard-coded in the origina
 - `trainSubgraphModel.py` imported `generateData`, which ran the whole generation at import time.
 - `README` calls `evaluate.py` for synthesis. That file does not exist. It is `generateData.py` (now `baed-generate`).
 - `nx.from_scipy_sparse_matrix` (removed in networkx 3) -> `from_scipy_sparse_array`.
+- The README training command uses `--parametrization xt_prescribed_st --loss_type vb_ce_xt_prescribred_st`
+  with `--arch TGNN_embedding_guided`, which `get_model()` rejects (assertion). Those options belong to
+  the degree-guided EDGE branch. `scripts/run_elliptic.sh` uses the consistent pair `xt` / `vb_ce_xt`.
+- `baed-gae-dataset` drops `train_neg_adj_mask` (a dense N x N mask, 2 GB on Elliptic) that nothing reads.
 
 ### Behaviour kept as released (worth knowing)
 
