@@ -1,0 +1,19 @@
+[package]
+name = "baed-graph"
+version = "0.1.0"
+edition = "2021"
+description = "Fast ego-graph extraction for BAED (PyO3 + rayon)"
+license = "MIT"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py311"] }
+numpy = "0.30"
+rayon = "1.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

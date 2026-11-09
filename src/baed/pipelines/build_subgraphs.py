@@ -1,0 +1,168 @@
+"""Step 01 - build the ego-graph datasets.
+
+For every labelled center node (label 1 only, or labels 0 and 1) extract its k-hop
+neighbourhood and save the list of ``nx.Graph`` objects (each with ``graph['sublabel']``)
+to ``data/graphs/<dataset>_init_<1|0_1>_dataset.pkl``.
+
+Hops per dataset (as in the original code): dgraph/elliptic 2, tfinance/photo/reddit/Amazon 1.
+tfinance additionally drops ego-graphs with more than 1200 nodes.
+
+Compared with ``createSubGraphDataset/createDataset.py`` the output is the same graphs,
+but the extraction runs in Rust on a CSR array (``baed.graph_ops``) instead of networkx,
+and Elliptic uses a sparse loader instead of a 330 GB dense matrix.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pickle as pkl
+import time
+import warnings
+
+import dgl
+import networkx as nx
+import numpy as np
+import scipy.io as sio
+import scipy.sparse as sp
+import torch
+from dgl.data.utils import load_graphs
+from loguru import logger
+
+from baed import paths
+from baed.datasets.elliptic import iter_timesteps
+from baed.graph_ops import build_ego_graphs
+
+warnings.filterwarnings("ignore")
+
+DATASETS = ["dgraph", "elliptic", "tfinance", "photo", "reddit", "Amazon"]
+LABEL_TYPES = ["label_1", "label_0_1"]
+
+
+def preprocess_features(features):
+    """Row-normalize a feature matrix and return it dense."""
+    rowsum = np.array(features.sum(1))
+    r_inv = np.power(rowsum, -1).flatten()
+    r_inv[np.isinf(r_inv)] = 0.0
+    r_mat_inv = sp.diags(r_inv)
+    features = r_mat_inv.dot(features)
+    return features.todense()
+
+
+def adj_to_dgl_graph(adj):
+    """SciPy sparse adjacency -> DGL graph (via networkx, as in the original code)."""
+    nx_graph = nx.from_scipy_sparse_array(adj)
+    return dgl.from_networkx(nx_graph)
+
+
+def select_centers(labels: torch.Tensor, label_type: str) -> list[int]:
+    if label_type == "label_1":
+        mask = labels == 1
+    elif label_type == "label_0_1":
+        mask = (labels == 0) | (labels == 1)
+    else:
+        raise ValueError("label_type must be 'label_1' or 'label_0_1'")
+    return torch.nonzero(mask, as_tuple=True)[0].tolist()
+
+
+def output_file(dataset: str, label_type: str):
+    suffix = "1" if label_type == "label_1" else "0_1"
+    return paths.ensure(paths.graph_file(f"{dataset}_init_{suffix}_dataset.pkl"))
+
+
+def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto"):
+    """``labels``: integer label per node, used to pick centers and for ``sublabel``.
+    Node attributes are taken from ``graph.ndata['feature']`` / ``graph.ndata['label']``."""
+    src, dst = graph.edges()
+    centers = select_centers(labels, label_type)
+    return build_ego_graphs(
+        src.numpy(),
+        dst.numpy(),
+        graph.num_nodes(),
+        graph.ndata["feature"],
+        graph.ndata["label"],
+        centers,
+        hops=hops,
+        max_nodes=max_nodes,
+        backend=backend,
+        center_labels=labels,
+    )
+
+
+def build(dataset: str, label_type: str, backend: str = "auto") -> list[nx.Graph]:
+    logger.info(f"dataset={dataset} label_type={label_type}")
+
+    if dataset == "dgraph":
+        item = np.load(paths.graph_file("dgraphfin.npz"))
+        edge_index = item["edge_index"]
+        graph = dgl.graph(
+            (torch.tensor(edge_index[:, 0], dtype=torch.int64), torch.tensor(edge_index[:, 1], dtype=torch.int64))
+        )
+        graph.ndata["feature"] = torch.tensor(item["x"], dtype=torch.float32)
+        graph.ndata["label"] = torch.tensor(item["y"], dtype=torch.int64)
+        return ego_from_dgl(graph, graph.ndata["label"], label_type, hops=2, backend=backend)
+
+    if dataset == "elliptic":
+        nx_graphs = []
+        for step in iter_timesteps(str(paths.graph_file("elliptic_bitcoin_dataset")), 1, 49, node_order="set"):
+            if len(step.tx_ids) == 0:
+                continue
+            graph = dgl.graph((torch.from_numpy(step.src), torch.from_numpy(step.dst)))
+            node_features = torch.tensor(step.features.values, dtype=torch.float32)
+            node_labels = torch.tensor(
+                step.classes["class"].apply(lambda x: 1 if x == "1" else 0).values, dtype=torch.int64
+            )
+            # Original behaviour: a timestep is used only if the DGL graph built from the
+            # edge list covers every labelled node (i.e. the highest-index node has an edge).
+            if len(node_features) != graph.num_nodes():
+                logger.debug(
+                    f"elliptic ts={step.ts}: skipped ({graph.num_nodes()} graph nodes vs {len(node_features)})"
+                )
+                continue
+            graph.ndata["feature"] = node_features
+            graph.ndata["label"] = node_labels
+            nx_graphs += ego_from_dgl(graph, node_labels, label_type, hops=2, backend=backend)
+        return nx_graphs
+
+    if dataset == "tfinance":
+        graph = load_graphs(str(paths.graph_file("tfinance")))[0][0]
+        labels = graph.ndata["label"].argmax(1)  # one-hot -> int (node attribute stays one-hot)
+        return ego_from_dgl(graph, labels, label_type, hops=1, max_nodes=1200, backend=backend)
+
+    if dataset in ["photo", "reddit", "Amazon"]:
+        data = sio.loadmat(str(paths.graph_file(f"{dataset}.mat")))
+        label = data.get("Label", data.get("gnd"))
+        attr = data.get("Attributes", data.get("X"))
+        network = data.get("Network", data.get("A"))
+        adj = sp.csr_matrix(network)
+        features = preprocess_features(sp.lil_matrix(attr))
+        graph = adj_to_dgl_graph(adj)
+        graph.ndata["feature"] = torch.tensor(features, dtype=torch.float32)
+        graph.ndata["label"] = torch.tensor(np.squeeze(np.array(label)), dtype=torch.int64)
+        return ego_from_dgl(graph, graph.ndata["label"], label_type, hops=1, backend=backend)
+
+    raise ValueError(f"unsupported dataset: {dataset}")
+
+
+def initOriginDataset(dataset: str, label_type: str, backend: str = "auto") -> None:
+    """Build and save one ego-graph dataset (name kept from the original code)."""
+    t0 = time.time()
+    nx_graphs = build(dataset, label_type, backend=backend)
+    out = output_file(dataset, label_type)
+    with open(out, "wb") as f:
+        pkl.dump(nx_graphs, f)
+    logger.info(f"saved {len(nx_graphs)} ego-graphs to {out} ({time.time() - t0:.1f}s)")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Step 01 - build k-hop ego-graph datasets.")
+    parser.add_argument("--dataset", nargs="+", default=DATASETS, choices=DATASETS)
+    parser.add_argument("--label-type", nargs="+", default=LABEL_TYPES, choices=LABEL_TYPES)
+    parser.add_argument("--backend", default="auto", choices=["auto", "rust", "python"])
+    args = parser.parse_args(argv)
+    for dataset in args.dataset:
+        for label_type in args.label_type:
+            initOriginDataset(dataset, label_type, backend=args.backend)
+
+
+if __name__ == "__main__":
+    main()

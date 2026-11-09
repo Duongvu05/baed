@@ -3,13 +3,56 @@ name = "baed"
 version = "0.1.0"
 description = "Refactored implementation of BAED - Balanced Anomaly-guided Ego-graph Diffusion Model for Inductive Graph Anomaly Detection (KDD 2026)."
 readme = "README.md"
-requires-python = ">= 3.11"
+requires-python = ">=3.11,<3.12"
+license = { file = "LICENSE" }
 authors = [
     { name = "Vu Ngoc Duong", email = "vungocduong255@gmail.com" }
 ]
 dependencies = [
     "loguru>=0.7.0",
+    # deep learning stack (CUDA 12.1 builds, see [tool.uv.sources])
+    "torch==2.3.1",
+    "torchvision==0.18.1",
+    "torch-geometric==2.5.3",
+    "torch-scatter==2.1.2",
+    "torch-sparse==0.6.18",
+    "dgl==2.4.0",
+    # Rust kernels (ego-graph extraction)
+    "baed-graph",
+    # scientific stack
+    "numpy>=1.26,<2",
+    "scipy>=1.11,<1.14",
+    "networkx>=3.2",
+    "pandas>=2.1",
+    "scikit-learn>=1.3",
+    "sympy>=1.12",
+    "powerlaw>=1.5",
+    "pyemd>=1.0",
+    "matplotlib>=3.8",
+    # logging / experiment tracking
+    "wandb>=0.17",
+    "tensorboard>=2.15",
+    "prettytable>=3.9",
+    "psutil>=5.9",
+    "tqdm>=4.66",
+    # dgl runtime deps not declared by the conda package
+    "requests>=2.31",
+    "pydantic>=2",
+    "torchdata==0.7.1",
+    "pyyaml>=6",
 ]
+
+[project.optional-dependencies]
+# models/detector.py (tree / outlier baselines), not used by the main pipeline
+detector = ["catboost>=1.2", "xgboost>=2.0", "pyod>=1.1"]
+
+[project.scripts]
+baed-build-subgraphs = "baed.pipelines.build_subgraphs:main"
+baed-gae-dataset = "baed.pipelines.gae_dataset:main"
+baed-gae-train = "baed.pipelines.gae_train:main"
+baed-train = "baed.pipelines.train:main"
+baed-generate = "baed.pipelines.generate:main"
+baed-detect = "baed.pipelines.detect:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -19,31 +62,71 @@ build-backend = "hatchling.build"
 packages = ["src/baed"]
 include = ["src/baed/.agents/**/*"]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.0.0",
     "pytest-watch>=4.2.0",
     "pre-commit>=3.7.0",
     "ruff>=0.4.0",
     "pyright>=1.1.360",
+    "maturin>=1.7,<2",
 ]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+find-links = ["https://data.pyg.org/whl/torch-2.3.0+cu121.html"]
+
+[tool.uv.workspace]
+members = ["rust/baed-graph"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+torchvision = { index = "pytorch-cu121" }
+dgl = { path = "wheels/dgl-2.4.0+cu121-cp311-cp311-linux_x86_64.whl" }
+baed-graph = { workspace = true }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
 
 [tool.ruff]
 target-version = "py311"
-line-length = 100
+line-length = 120
 src = ["src", "tests"]
+# The model code is kept as released by the authors (star imports, Chinese comments,
+# unused variables). Lint only the code written for this refactor.
+extend-exclude = [
+    "src/baed/diffusion",
+    "src/baed/layers",
+    "src/baed/models",
+    "src/baed/eval_utils",
+    "src/baed/gae",
+    "src/baed/datasets/data.py",
+    "src/baed/datasets/data_utils.py",
+    "src/baed/datasets/evaluator.py",
+    "src/baed/datasets/graphDataset.py",
+    "src/baed/model.py",
+    "src/baed/experiment.py",
+    "src/baed/utils.py",
+    "src/baed/pipelines/train.py",
+    "src/baed/pipelines/generate.py",
+    "src/baed/pipelines/detect.py",
+    "src/baed/pipelines/gae_dataset.py",
+    "src/baed/pipelines/gae_train.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "UP", "B", "SIM", "N", "RUF"]
-ignore = ["E501", "N802", "N803", "N806", "B905", "SIM108"]
+ignore = ["E501", "N802", "N803", "N806", "B905", "SIM108", "RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["baed"]
+known-first-party = ["baed", "baed_graph"]
 
 [tool.pyright]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
-include = ["src"]
+include = ["src/baed/paths.py", "src/baed/graph_ops.py", "src/baed/datasets/elliptic.py", "src/baed/pipelines/build_subgraphs.py"]
 exclude = ["tests"]
 venvPath = "."
 venv = ".venv"

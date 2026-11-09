@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "baed-graph"
+version = "0.1.0"
+description = "Rust kernels (ego-graph extraction) for BAED"
+requires-python = ">=3.11"
+dependencies = ["numpy"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "baed_graph._core"
+features = ["pyo3/extension-module"]

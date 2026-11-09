@@ -1,0 +1,23 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# rust
+target/
+*.so
+
+# locally built DGL wheel (scripts/build_dgl_wheel.py)
+wheels/
+
+# data, weights and run outputs (see src/baed/paths.py)
+data/
+weights/
+outputs/
+wandb/
+logs/
