@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--n", type=int, default=110)
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--mode", default="default", help="torch.compile mode")
+    ap.add_argument("--dynamic", default="true", choices=["true", "false", "none"])
     a = ap.parse_args()
 
     gen = GraphDataGenerator(GenerateDataArgs(run_name=a.run_name, dataset=a.dataset, seed=0, checkpoint=a.checkpoint))
@@ -49,7 +50,8 @@ def main():
     eager_fn = model._denoise_fn
     with torch.no_grad():
         ref = eager_fn(copy.copy(g), tn, te, emb)
-    compiled = torch.compile(eager_fn, dynamic=True, mode=a.mode)
+    dyn = {"true": True, "false": False, "none": None}[a.dynamic]
+    compiled = torch.compile(eager_fn, dynamic=dyn, mode=a.mode)
     t0 = time.time()
     with torch.no_grad():
         out = compiled(copy.copy(g), tn, te, emb)
