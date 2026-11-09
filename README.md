@@ -50,9 +50,9 @@ DGL no longer ships CUDA wheels on PyPI and `data.dgl.ai` is unreachable from ou
 
 ```bash
 bash scripts/download_data.sh elliptic     # also: dgraph tfinance reddit
-bash scripts/run_elliptic.sh               # steps 01 -> 03 with the authors' hyper-parameters
-uv run baed-generate --run-name <run> --dataset elliptic --checkpoint 2000
-uv run baed-detect --dataset elliptic --model GraphSAGE --gae-weight elliptic_gae_relu_256.pt --node-feats 166
+bash scripts/run_elliptic.sh               # steps 01 -> 03, paper hyper-parameters (300 epochs)
+uv run baed-generate --run-name <run> --dataset elliptic --checkpoint 300
+uv run baed-detect --dataset elliptic --model GraphSAGE --gae-weight elliptic_gae_relu_256.pt --node-feats 166 --epochs 50
 ```
 
 Every step has `--help`. Defaults reproduce the values hard-coded in the original scripts.
@@ -67,6 +67,25 @@ Every step has `--help`. Defaults reproduce the values hard-coded in the origina
 | Env | Python 3.7, torch 1.8.1, dgl-cu101 0.6.1 | Python 3.11, torch 2.3.1+cu121, PyG 2.5.3, DGL 2.4.0+cu121 |
 | Ego-graphs | networkx BFS per center | Rust CSR BFS, parallel over all cores |
 | Elliptic loader | dense 203769 x 203769 DataFrame per timestep (~330 GB) | sparse edge list, same output |
+
+### Hyper-parameters vs. the paper (Appendix D, Sec. 5.1.4)
+
+| Setting | Paper | Upstream README / code | Here |
+|---|---|---|---|
+| Diffusion epochs | **300** | 2000 | 300 (`run_elliptic.sh`) |
+| Diffusion dim / steps | 64 / 128 | 64 / 128 | same |
+| LR / optimizer | 1e-4 / Adam | 1e-4 / Adam, constant (no milestones) | same |
+| Noise schedule / dropout | linear / 0.1 | linear / 0.1 | same |
+| Attention heads, degree | 8 heads, node degree | `--num_heads 8 8 8 8 1 --degree` | same |
+| Batch size | not stated | 8 | 8 |
+| Parametrization / loss | not stated | `xt_prescribed_st` / `vb_ce_xt_prescribred_st` (rejected by code) | `xt` / `vb_ce_xt` |
+| Downstream epochs | 50 | 10 (`trainSubgraphModel.py`) | pass `--epochs 50` |
+| Downstream LR | tuned in 1e-3 ... 1e-6 | 1e-4 | `--lr` |
+| Split | 70 / 15 / 15 | 70 / 15 / 15 (sequential, no shuffle) | same |
+| Seeds | 15, 42, 63, 87, 94 | 0 | `--seed` |
+
+LR is constant and early stopping is disabled in `diffusion/base.py`, so the epoch-300 checkpoint
+of a longer run equals a 300-epoch run.
 
 ### Fixes needed to make the released code run
 

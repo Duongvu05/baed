@@ -6,7 +6,7 @@
 #   bash scripts/run_elliptic.sh [epochs]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-EPOCHS="${1:-2000}"
+EPOCHS="${1:-300}"   # paper, Appendix D (the upstream README used 2000)
 DEVICE="${DEVICE:-cuda:0}"
 
 # 01 ego-graph datasets (Rust kernel)
