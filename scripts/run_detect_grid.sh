@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DS=$1; NF=$2; GAE=$3; MODE=$4; RUN=${5:-}; CK=${6:-300}
-SEEDS="${SEEDS:-15 42 63 87 94}"
+SEEDS="${SEEDS:-15}"   # paper averages 15 42 63 87 94, we run one seed
 MODELS="${MODELS:-GCN BWGNN GraphSAGE BernNet}"
 EPOCHS="${EPOCHS:-50}"
 mkdir -p outputs/results/$DS outputs/logs/$DS
