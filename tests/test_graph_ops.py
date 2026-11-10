@@ -103,3 +103,26 @@ def test_lean_convert_matches_from_networkx():
         assert {tuple(e) for e in ei.t().tolist()} == {tuple(e) for e in d.edge_index.t().tolist()}
         assert ei.size(1) == d.edge_index.size(1)
         assert y == G.graph["sublabel"]
+
+
+def test_bidirectional_matches_undirected_ego_graph():
+    """bidirectional=True == k-hop ego-graph of the undirected graph (in- and out-neighbours)."""
+    rng = np.random.default_rng(1)
+    n = 60
+    src = rng.integers(0, n, 150)
+    dst = rng.integers(0, n, 150)
+    feats = torch.randn(n, 4)
+    labels = torch.randint(0, 2, (n,))
+    centers = list(range(0, n, 3))
+    und = nx.Graph()
+    und.add_nodes_from(range(n))
+    und.add_edges_from(zip(src.tolist(), dst.tolist()))
+    for backend in (["python", "rust"] if graph_ops.HAS_RUST else ["python"]):
+        graphs = graph_ops.build_ego_graphs(src, dst, n, feats, labels, centers, hops=2, backend=backend, bidirectional=True)
+        for c, g in zip(centers, graphs):
+            ref = nx.ego_graph(und, c, radius=2)
+            assert set(g.nodes) == set(ref.nodes)
+            assert {frozenset(e) for e in g.edges} == {frozenset(e) for e in ref.edges}
+    # out-edge-only ego-graphs are never larger
+    out = graph_ops.build_ego_graphs(src, dst, n, feats, labels, centers, hops=2, backend="python")
+    assert all(set(a.nodes) <= set(b.nodes) for a, b in zip(out, graphs))

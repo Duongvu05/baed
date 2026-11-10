@@ -11,6 +11,8 @@ output is used when the extension is not installed.
 Semantics are the same as the original code:
 
 * BFS follows **out**-edges of the directed graph (networkx ``MultiDiGraph`` behaviour).
+  With ``bidirectional=True`` it follows edges in both directions instead (in- and
+  out-neighbours, i.e. the k-hop neighbourhood of the undirected graph).
 * The ego-graph keeps every edge between kept nodes, merged into an undirected
   ``nx.Graph`` (self-loops kept).
 * Node attributes ``feature`` (float tensor [F]) and ``label`` (0-d int tensor), and the
@@ -114,18 +116,23 @@ def build_ego_graphs(
     max_nodes: int | None = None,
     backend: str = "auto",
     center_labels: torch.Tensor | None = None,
+    bidirectional: bool = False,
 ) -> list[nx.Graph]:
     """Extract ego-graphs around ``centers`` and return them as attributed ``nx.Graph`` objects.
 
     ``labels`` is stored per node (``label`` attribute); ``center_labels`` (default ``labels``)
     gives ``graph['sublabel']``. They differ for tfinance, whose node labels are one-hot.
+    ``bidirectional``: BFS over in- and out-edges (the original code follows out-edges only).
     """
     if center_labels is None:
         center_labels = labels
-    indptr, indices = to_csr(np.asarray(src), np.asarray(dst), num_nodes)
+    src, dst = np.asarray(src), np.asarray(dst)
+    if bidirectional:
+        src, dst = np.concatenate([src, dst]), np.concatenate([dst, src])
+    indptr, indices = to_csr(src, dst, num_nodes)
     centers = np.asarray(list(centers), dtype=np.int64)
     logger.info(
-        f"ego-graphs: {len(centers)} centers, {hops} hop(s), backend="
+        f"ego-graphs: {len(centers)} centers, {hops} hop(s), {'both directions' if bidirectional else 'out-edges'}, backend="
         f"{'rust' if (backend != 'python' and HAS_RUST) else 'python'}"
     )
     kept, node_ptr, nodes, edge_ptr, edges = ego_subgraphs(indptr, indices, centers, hops, max_nodes, backend)

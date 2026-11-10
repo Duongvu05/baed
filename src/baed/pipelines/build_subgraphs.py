@@ -69,7 +69,7 @@ def output_file(dataset: str, label_type: str, tag: str = ""):
     return paths.ensure(paths.graph_file(f"{dataset}{tag}_init_{suffix}_dataset.pkl"))
 
 
-def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto"):
+def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto", bidirectional=False):
     """``labels``: integer label per node, used to pick centers and for ``sublabel``.
     Node attributes are taken from ``graph.ndata['feature']`` / ``graph.ndata['label']``."""
     src, dst = graph.edges()
@@ -85,10 +85,12 @@ def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto"
         max_nodes=max_nodes,
         backend=backend,
         center_labels=labels,
+        bidirectional=bidirectional,
     )
 
 
-def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False) -> list[nx.Graph]:
+def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
+          bidirectional: bool = False) -> list[nx.Graph]:
     logger.info(f"dataset={dataset} label_type={label_type}")
 
     if dataset == "dgraph":
@@ -99,7 +101,7 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
         )
         graph.ndata["feature"] = torch.tensor(item["x"], dtype=torch.float32)
         graph.ndata["label"] = torch.tensor(item["y"], dtype=torch.int64)
-        return ego_from_dgl(graph, graph.ndata["label"], label_type, hops=2, backend=backend)
+        return ego_from_dgl(graph, graph.ndata["label"], label_type, hops=2, backend=backend, bidirectional=bidirectional)
 
     if dataset == "elliptic":
         nx_graphs = []
@@ -124,13 +126,13 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
                 continue
             graph.ndata["feature"] = node_features
             graph.ndata["label"] = node_labels
-            nx_graphs += ego_from_dgl(graph, node_labels, label_type, hops=2, backend=backend)
+            nx_graphs += ego_from_dgl(graph, node_labels, label_type, hops=2, backend=backend, bidirectional=bidirectional)
         return nx_graphs
 
     if dataset == "tfinance":
         graph = load_graphs(str(paths.graph_file("tfinance")))[0][0]
         labels = graph.ndata["label"].argmax(1)  # one-hot -> int (node attribute stays one-hot)
-        return ego_from_dgl(graph, labels, label_type, hops=1, max_nodes=1200, backend=backend)
+        return ego_from_dgl(graph, labels, label_type, hops=1, max_nodes=1200, backend=backend, bidirectional=bidirectional)
 
     if dataset in ["photo", "reddit", "Amazon"]:
         data = sio.loadmat(str(paths.graph_file(f"{dataset}.mat")))
@@ -142,16 +144,18 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
         graph = adj_to_dgl_graph(adj)
         graph.ndata["feature"] = torch.tensor(features, dtype=torch.float32)
         graph.ndata["label"] = torch.tensor(np.squeeze(np.array(label)), dtype=torch.int64)
-        return ego_from_dgl(graph, graph.ndata["label"], label_type, hops=1, backend=backend)
+        return ego_from_dgl(graph, graph.ndata["label"], label_type, hops=1, backend=backend, bidirectional=bidirectional)
 
     raise ValueError(f"unsupported dataset: {dataset}")
 
 
-def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False) -> None:
+def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
+                      bidirectional: bool = False) -> None:
     """Build and save one ego-graph dataset (name kept from the original code)."""
     t0 = time.time()
-    nx_graphs = build(dataset, label_type, backend=backend, elliptic_full=elliptic_full)
-    out = output_file(dataset, label_type, tag="_full" if elliptic_full else "")
+    nx_graphs = build(dataset, label_type, backend=backend, elliptic_full=elliptic_full, bidirectional=bidirectional)
+    tag = ("_full" if elliptic_full else "") + ("_bi" if bidirectional else "")
+    out = output_file(dataset, label_type, tag=tag)
     with open(out, "wb") as f:
         pkl.dump(nx_graphs, f)
     logger.info(f"saved {len(nx_graphs)} ego-graphs to {out} ({time.time() - t0:.1f}s)")
@@ -165,11 +169,14 @@ def main(argv=None):
     parser.add_argument("--elliptic-full", action="store_true",
                         help="Elliptic: keep all 49 timesteps (fixes two quirks of the original code); "
                              "writes elliptic_full_init_*_dataset.pkl")
+    parser.add_argument("--bidirectional", action="store_true",
+                        help="ego-graphs over in- and out-edges (original: out-edges only); adds _bi to the file name")
     args = parser.parse_args(argv)
     for dataset in args.dataset:
         for label_type in args.label_type:
             initOriginDataset(dataset, label_type, backend=args.backend,
-                              elliptic_full=args.elliptic_full and dataset == "elliptic")
+                              elliptic_full=args.elliptic_full and dataset == "elliptic",
+                              bidirectional=args.bidirectional)
 
 
 if __name__ == "__main__":
