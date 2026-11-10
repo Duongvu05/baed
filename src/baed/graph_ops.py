@@ -149,7 +149,10 @@ def build_ego_graphs(
         feat = features[idx]
         lab = labels[idx]
         g = nx.Graph()
-        g.add_nodes_from((int(n), {"feature": feat[i], "label": lab[i]}) for i, n in enumerate(nd.tolist()))
+        # clone: a view would pickle the whole per-graph tensor once per node (85 GB on bidirectional Elliptic)
+        g.add_nodes_from(
+            (int(n), {"feature": feat[i].clone(), "label": lab[i].clone()}) for i, n in enumerate(nd.tolist())
+        )
         # dgl.to_networkx stores an edge attribute ``id``. Downstream code relies on it
         # existing (``del pyg_data.id`` after from_networkx), never on its value.
         g.add_edges_from((u, v, {"id": k}) for k, (u, v) in enumerate(ed.tolist()))
