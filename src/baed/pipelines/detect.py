@@ -613,6 +613,9 @@ def run(argv=None):
                         help="(--batched) guidance weights: linear = released code (loss / sum), sigmoid = paper Eq. 17")
     parser.add_argument("--cur-alpha", type=float, default=1.0)
     parser.add_argument("--cur-beta", type=float, default=None, help="default: mean anomaly loss of the batch")
+    parser.add_argument("--aug-gen", default="baed", choices=["baed", "ggad", "aegis"],
+                        help="(--batched, with --use-baed) generator of synthetic anomalies: BAED diffusion, or the "
+                             "GGAD / AEGIS baselines adapted to ego-graphs (see baed.aug_generators)")
     parser.add_argument("--data-tag", default="", help="ego-graph file suffix, e.g. _full -> <dataset>_full_init_0_1_dataset.pkl")
     parser.add_argument("--out", default=None, help="write metrics as JSON here")
     cli = parser.parse_args(argv)
@@ -621,6 +624,8 @@ def run(argv=None):
     AUG.update(gen_noise=cli.gen_noise, curriculum=cli.curriculum, alpha=cli.cur_alpha, beta=cli.cur_beta)
     if cli.keep_isolated and not cli.batched:
         parser.error("--keep-isolated requires --batched")
+    if cli.aug_gen != "baed" and not (cli.batched and cli.use_baed):
+        parser.error("--aug-gen ggad/aegis requires --batched and --use-baed")
     set_seed(cli.seed)
     dataset = cli.dataset
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -637,20 +642,25 @@ def run(argv=None):
     print("数据集样本总数为:", len(nx_graphs))
 
     generator = None
-    if cli.use_baed:
+    if cli.use_baed and cli.aug_gen == "baed":
         gen_args = GenerateDataArgs(run_name=cli.run_name, dataset=dataset, num_samples=64, seed=cli.seed, checkpoint=cli.checkpoint)
         generator = GraphDataGenerator(gen_args)
         set_seed(cli.seed)  # the generator setup consumes RNG state
 
     detector = build_detector(cli.model, cli.node_feats).to(device)
     optimizer = optim.Adam(detector.parameters(), lr=cli.lr)
-    tag = f"{cli.model}_{'BAED' if cli.use_baed else 'None'}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "")
+    tag = f"{cli.model}_{(cli.aug_gen.upper() if cli.use_baed else 'None')}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "")
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
     def loaders(train_nx, eval_nx, test_nx):
+        nonlocal generator
         if cli.batched:
             sets = [[it for it in x if keep(it, cli.keep_isolated)] for x in (train_nx, eval_nx, test_nx)]
+            if cli.use_baed and cli.aug_gen != "baed":  # GGAD / AEGIS: fit on the current training set only
+                from baed.aug_generators import make_generator
+                generator = make_generator(cli.aug_gen, sets[0], seed=cli.seed, device=str(device))
+                set_seed(cli.seed)
             print("训练集/验证集/测试集样本数:", [len(x) for x in sets], "train anomalies:", sum(it[2] for it in sets[0]))
             dl = [DataLoader(x, batch_size=batch_size, shuffle=(k == 0), collate_fn=lean_collate) for k, x in enumerate(sets)]
             return sets, dl
