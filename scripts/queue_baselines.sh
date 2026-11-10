@@ -9,27 +9,29 @@ export DGLBACKEND=pytorch OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
 MODELS="${MODELS:-GCN BWGNN GraphSAGE BernNet}"
 LRS="${LRS:-0.001 0.0001 0.00001 0.000001}"
 SEEDS="${SEEDS:-15 42 63 87 94}"
-TAGS="${TAGS:-_full_bi _full}"   # _full_bi = ego-graphs over both edge directions
+TAGS="${TAGS:-_full_bi _full}"
+ISO="${ISO:-1}"   # 1 = keep single-node ego-graphs (self-loop), 0 = drop them as the released code does
+SFX=$([ "$ISO" = 1 ] || echo _noiso)   # _full_bi = ego-graphs over both edge directions
 R=outputs/results/elliptic/base; L=outputs/logs/elliptic/base; mkdir -p $R $L
 
 # wait for any running detector job (keeps the GPU to one job)
 while pgrep -f "bin/baed-detect" >/dev/null; do sleep 30; done
 
 run() { # model tag lr seed
-  local out=$R/${1}${2}_lr${3}_s${4}.json
+  local out=$R/${1}${2}${SFX}_lr${3}_s${4}.json
   [ -s "$out" ] && return
-  echo "[$(date -u +%H:%M:%S)] $1 tag=$2 lr=$3 seed=$4"
+  echo "[$(date -u +%H:%M:%S)] $1 tag=$2$SFX lr=$3 seed=$4"
   uv run baed-detect --dataset elliptic --model "$1" --node-feats 166 --gae-weight elliptic_gae_relu_256.pt \
-    --epochs 50 --seed "$4" --batched --lr "$3" --keep-isolated --data-tag "$2" --out "$out" \
-    > $L/${1}${2}_lr${3}_s${4}.log 2>&1 < /dev/null || echo "  FAILED (see $L/${1}${2}_lr${3}_s${4}.log)"
+    --epochs 50 --seed "$4" --batched --lr "$3" $([ "$ISO" = 1 ] && echo --keep-isolated) --data-tag "$2" --out "$out" \
+    > $L/${1}${2}${SFX}_lr${3}_s${4}.log 2>&1 < /dev/null || echo "  FAILED (see $L/${1}${2}${SFX}_lr${3}_s${4}.log)"
 }
 
 best_lr() { # model tag -> lr with highest val AUROC among seed-15 runs
-  python3 - "$R" "$1" "$2" <<'PY'
+  python3 - "$R" "$1" "$2" "$SFX" <<'PY'
 import json, glob, sys, re
-R, m, tag = sys.argv[1:]
+R, m, tag, sfx = sys.argv[1:]
 best = max((json.load(open(f))["steps"][-1].get("val_auroc", 0), re.search(r"_lr([0-9.]+)_s15", f).group(1))
-           for f in glob.glob(f"{R}/{m}{tag}_lr*_s15.json"))
+           for f in glob.glob(f"{R}/{m}{tag}{sfx}_lr*_s15.json"))
 print(best[1])
 PY
 }
@@ -41,7 +43,7 @@ for f in outputs/results/elliptic/*_base_full_b_iso_lr*_s15.json; do
   [ -s "$R/${m}_full_lr${lr}_s15.json" ] || cp "$f" "$R/${m}_full_lr${lr}_s15.json"
 done
 for tag in $TAGS; do for m in $MODELS; do
-  lr=$(best_lr $m $tag); echo "[$(date -u +%H:%M:%S)] $m $tag selected lr=$lr" | tee -a $R/lr_choice.txt
+  lr=$(best_lr $m $tag); echo "[$(date -u +%H:%M:%S)] $m $tag$SFX selected lr=$lr" | tee -a $R/lr_choice.txt
   for s in $SEEDS; do run $m $tag $lr $s; done
 done; done
 echo "[$(date -u +%H:%M:%S)] done"
