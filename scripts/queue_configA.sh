@@ -29,9 +29,8 @@ run() { # model mode
     > $L/${m}_${mode}_s${SEED}.log 2>&1 < /dev/null || echo "  FAILED (see $L/${m}_${mode}_s${SEED}.log)"
 }
 
-run GCN dyn_base                                              # Table 2, base (fast)
+[ -n "${TABLE2:-}" ] && run GCN dyn_base                      # Table 2 only with TABLE2=1
 for m in GCN BWGNN GraphSAGE BernNet; do run $m baed; done    # Table 1, +BAED
 for g in ggad aegis; do for m in GCN BWGNN GraphSAGE BernNet; do run $m $g; done; done   # Table 1, +GGAD / +AEGIS
-run GCN dyn_ggad; run GCN dyn_aegis                           # Table 2, +GGAD / +AEGIS
-run GCN dyn_baed                                              # Table 2, +BAED
+if [ -n "${TABLE2:-}" ]; then run GCN dyn_ggad; run GCN dyn_aegis; run GCN dyn_baed; fi   # Table 2
 echo "[$(date -u +%H:%M:%S)] done"
