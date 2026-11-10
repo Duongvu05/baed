@@ -3,6 +3,7 @@
 # out-edge ego-graphs (_full, all 49 timesteps), single-node ego-graphs dropped, batched updates,
 # seed 15, one lr per model (val-selected on the out-edge set). +BAED uses the leakage-free
 # diffusion run (train-split anomalies) with the paper augmentation (N(0,1) noise, sigmoid curriculum).
+# +GGAD / +AEGIS: baselines adapted to ego-graphs (baed.aug_generators), same batch balancing.
 # Results: outputs/results/elliptic/configA/<model>_<mode>_s15.json
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -16,7 +17,11 @@ while pgrep -f "bin/baed-detect" >/dev/null; do sleep 30; done   # one GPU job a
 run() { # model mode
   local m=$1 mode=$2 out=$R/${1}_${2}_s${SEED}.json extra=()
   [ -s "$out" ] && return
-  case $mode in *baed) extra+=(--use-baed --with-condition --run-name "$RUN" --checkpoint "$CK" --gen-noise 1.0 --curriculum sigmoid);; esac
+  case $mode in
+    *baed) extra+=(--use-baed --with-condition --run-name "$RUN" --checkpoint "$CK" --gen-noise 1.0 --curriculum sigmoid);;
+    *ggad) extra+=(--use-baed --aug-gen ggad);;
+    *aegis) extra+=(--use-baed --aug-gen aegis);;
+  esac
   case $mode in dyn_*) extra+=(--dynamic-segments 4);; esac
   echo "[$(date -u +%H:%M:%S)] $m $mode lr=${LR[$m]}"
   uv run baed-detect --dataset elliptic --model "$m" --node-feats 166 --gae-weight elliptic_gae_relu_256.pt \
@@ -26,5 +31,7 @@ run() { # model mode
 
 run GCN dyn_base                                              # Table 2, base (fast)
 for m in GCN BWGNN GraphSAGE BernNet; do run $m baed; done    # Table 1, +BAED
+for g in ggad aegis; do for m in GCN BWGNN GraphSAGE BernNet; do run $m $g; done; done   # Table 1, +GGAD / +AEGIS
+run GCN dyn_ggad; run GCN dyn_aegis                           # Table 2, +GGAD / +AEGIS
 run GCN dyn_baed                                              # Table 2, +BAED
 echo "[$(date -u +%H:%M:%S)] done"
