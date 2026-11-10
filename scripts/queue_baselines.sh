@@ -9,10 +9,11 @@ export DGLBACKEND=pytorch OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
 MODELS="${MODELS:-GCN BWGNN GraphSAGE BernNet}"
 LRS="${LRS:-0.001 0.0001 0.00001 0.000001}"
 SEEDS="${SEEDS:-15 42 63 87 94}"
+TAGS="${TAGS:-_full_bi _full}"   # _full_bi = ego-graphs over both edge directions
 R=outputs/results/elliptic/base; L=outputs/logs/elliptic/base; mkdir -p $R $L
 
 # wait for any running detector job (keeps the GPU to one job)
-while pgrep -f "baed-detect --dataset elliptic --model .* --use-baed" >/dev/null; do sleep 60; done
+while pgrep -f "bin/baed-detect" >/dev/null; do sleep 30; done
 
 run() { # model tag lr seed
   local out=$R/${1}${2}_lr${3}_s${4}.json
@@ -33,13 +34,13 @@ print(best[1])
 PY
 }
 
-for m in $MODELS; do for lr in $LRS; do run $m _full_bi $lr 15; done; done
+for tag in $TAGS; do [ "$tag" = _full ] && continue; for m in $MODELS; do for lr in $LRS; do run $m $tag $lr 15; done; done; done
 # reuse the seed-15 lr grid already run for _full (out-edges)
 for f in outputs/results/elliptic/*_base_full_b_iso_lr*_s15.json; do
   b=$(basename "$f"); m=${b%%_*}; lr=$(echo "$b" | sed -E 's/.*_lr([0-9.]+)_s15.json/\1/')
   [ -s "$R/${m}_full_lr${lr}_s15.json" ] || cp "$f" "$R/${m}_full_lr${lr}_s15.json"
 done
-for tag in _full_bi _full; do for m in $MODELS; do
+for tag in $TAGS; do for m in $MODELS; do
   lr=$(best_lr $m $tag); echo "[$(date -u +%H:%M:%S)] $m $tag selected lr=$lr" | tee -a $R/lr_choice.txt
   for s in $SEEDS; do run $m $tag $lr $s; done
 done; done
