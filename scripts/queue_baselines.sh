@@ -36,7 +36,7 @@ print(best[1])
 PY
 }
 
-for tag in $TAGS; do [ "$tag" = _full ] && continue; for m in $MODELS; do for lr in $LRS; do run $m $tag $lr 15; done; done; done
+for tag in $TAGS; do [ "$tag" = _full ] && [ "$ISO" = 1 ] && continue; for m in $MODELS; do for lr in $LRS; do run $m $tag $lr 15; done; done; done
 # reuse the seed-15 lr grid already run for _full (out-edges)
 for f in outputs/results/elliptic/*_base_full_b_iso_lr*_s15.json; do
   b=$(basename "$f"); m=${b%%_*}; lr=$(echo "$b" | sed -E 's/.*_lr([0-9.]+)_s15.json/\1/')
