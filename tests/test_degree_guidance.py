@@ -44,9 +44,9 @@ def build(gae, graphs):
     args = Namespace(
         dataset="elliptic", arch="TGNN_degree_embedding_guided", parametrization="xt_prescribed_st",
         loss_type="vb_ce_xt_prescribred_st", degree=True, max_degree=4, num_node_classes=2, num_edge_classes=2,
-        diffusion_dim=16, diffusion_steps=8, num_heads=[2, 1], dp_rate=0.0, norm="None",
-        augmented_feature_dict={}, has_node_feature=False, final_prob_node=[1.0, 0.0],
-        final_prob_edge=[1.0, 0.0], sample_time_method="uniform", noise_schedule="linear", device="cpu",
+        diffusion_dim=16, diffusion_steps=128, num_heads=[2, 1], dp_rate=0.0, norm="None",
+        augmented_feature_dict={}, has_node_feature=False, final_prob_node=[1 - 1e-12, 1e-12],
+        final_prob_edge=[1 - 1e-12, 1e-12], sample_time_method="uniform", noise_schedule="linear", device="cpu",
     )
     return pyg, get_model(args, initial_graph_sampler=sampler)
 
