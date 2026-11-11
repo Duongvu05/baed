@@ -78,6 +78,8 @@ def main(argv=None):
     parser.add_argument("--gae-type", default="VGAE", choices=["gae", "gin", "VGAE"])
     parser.add_argument("--activation", default="relu")
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--data-tag", default="", help="data/gae/<dataset><tag>_gae.pt, e.g. _inductive")
+    parser.add_argument("--lr", type=float, default=0.001)
     args = parser.parse_args(argv)
     """
     elliptic:
@@ -90,8 +92,14 @@ def main(argv=None):
     gae_type = args.gae_type
     activation = args.activation
     epochs = args.epochs
-    data = load_data(paths.gae_data_dir() / f"{dataset}_gae.pt")
+    data = load_data(paths.gae_data_dir() / f"{dataset}{args.data_tag}_gae.pt")
     model, device, x, train_pos_edge_index, optimizer = configure_model(data, out_channels, num_features,activation,gae_type)
+    for group in optimizer.param_groups:
+        group["lr"] = args.lr
+    future = None
+    if hasattr(data, "future_x"):  # inductive link prediction on a later period the encoder never saw
+        future = (data.future_x.to(device), data.future_msg_edge_index.to(device),
+                  data.future_pos_edge_index.to(device), data.future_neg_edge_index.to(device))
 
     best_auc = 0.0
     best_model = None
@@ -99,14 +107,22 @@ def main(argv=None):
         loss = train(model, optimizer, x, train_pos_edge_index)
         auc, ap = test(model, x, train_pos_edge_index, data.test_pos_edge_index, data.test_neg_edge_index)
         val_auc, _ = test(model, x, train_pos_edge_index, data.val_pos_edge_index, data.val_neg_edge_index)
-        print('Epoch: {:03d}, val AUC: {:.4f}, test AUC: {:.4f}, AP: {:.4f}'.format(epoch, val_auc, auc, ap))
+        msg = 'Epoch: {:03d}, loss {:.4f}, val AUC: {:.4f}, test AUC: {:.4f}, AP: {:.4f}'.format(epoch, loss, val_auc, auc, ap)
+        if future is not None:
+            f_auc, f_ap = test(model, future[0], future[1], future[2], future[3])
+            msg += ', future AUC: {:.4f}, AP: {:.4f}'.format(f_auc, f_ap)
+        print(msg)
         # select on validation edges; deepcopy (the released code kept a reference, i.e. the last epoch)
         if val_auc > best_auc:
             best_auc = val_auc
             best_model = copy.deepcopy(model)
 
     print("Best val AUC:", best_auc)
-    out = paths.ensure(paths.gae_weight(f'{dataset}_{gae_type}_{activation}_{out_channels}.pt'))
+    out = paths.ensure(paths.gae_weight(f'{dataset}_{gae_type}_{activation}_{out_channels}{args.data_tag}.pt'))
+    if future is not None:
+        best_model.eval()
+        f_auc, f_ap = test(best_model, future[0], future[1], future[2], future[3])
+        print("Best model future AUC: {:.4f}, AP: {:.4f}".format(f_auc, f_ap))
     torch.save(best_model, out)
     print("saved:", out)
     print("x:", x.size())

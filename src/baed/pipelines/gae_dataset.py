@@ -85,6 +85,76 @@ def load_elliptic_data(data_dir, start_ts, end_ts):
     return [(s.src, s.dst) for s in steps], [s.features for s in steps], [s.classes for s in steps]
 
 
+def load_elliptic_whole():
+    """The whole Elliptic graph for pre-training the guidance encoder (link prediction, no labels).
+
+    All 203,769 transactions of the 49 timesteps, labelled and unknown, and all 234,355 edges,
+    with one global node numbering. The released ``load_dataset('elliptic')`` concatenated
+    per-timestep local node ids without offsets (22,340 edges of 48 timesteps on node ids
+    < 2,152), so its GAE was trained on a scrambled graph.
+    """
+    from baed.datasets.elliptic import read_elliptic
+    from torch_geometric.utils import to_undirected
+
+    classes, edgelist, features = read_elliptic(str(paths.graph_file("elliptic_bitcoin_dataset")))
+    idx = {tx: i for i, tx in enumerate(features.index)}
+    src = torch.tensor(edgelist.iloc[:, 0].map(idx).values, dtype=torch.long)
+    dst = torch.tensor(edgelist.iloc[:, 1].map(idx).values, dtype=torch.long)
+    x = torch.tensor(features.values, dtype=torch.float32)  # 166 columns: timestep + 165 features
+    y = classes["class"].reindex(features.index).map({"1": 1, "2": 0}).fillna(-1).astype(int).values
+    edge_index = to_undirected(torch.stack([src, dst]), num_nodes=len(idx))
+    print(f"elliptic whole graph: nodes {len(idx)}, undirected edges {edge_index.size(1) // 2}, features {x.shape[1]}")
+    return Data(x=x, edge_index=edge_index, y=torch.tensor(y))
+
+
+def load_elliptic_inductive(train_ratio=0.7, eval_ratio=0.15, future_holdout=0.2, seed=0):
+    """Elliptic link-prediction data for pre-training the guidance encoder without test leakage.
+
+    Fixes of the released ``load_dataset('elliptic')``: per-timestep local node ids are offset
+    into one global numbering (the release concatenated them as is, so 22,340 edges of 48
+    timesteps landed on node ids < 2,152 and 42k nodes had no edge), and all 49 timesteps are
+    used. Nodes are the labelled transactions in the order of the ``_full`` ego-graph dataset
+    (timestep, then node), so the detector's sequential split applies node by node:
+
+    * ``train`` graph: the first ``train_ratio`` nodes (detector train split) -> GAE edge split;
+    * ``future_*``: the next ``eval_ratio`` nodes (detector validation period), a graph the
+      encoder never sees in training. ``future_holdout`` of its edges are positives to predict
+      from the remaining ones (inductive link prediction), with as many sampled negatives.
+    """
+    from torch_geometric.utils import negative_sampling, to_undirected
+
+    steps = list(iter_timesteps(str(paths.graph_file("elliptic_bitcoin_dataset")), 0, 49, node_order="set"))
+    xs, ys, srcs, dsts, off = [], [], [], [], 0
+    for st in steps:
+        xs.append(torch.tensor(st.features.values, dtype=torch.float32))
+        ys.append(torch.tensor((st.classes["class"] == "1").values.astype(np.int64)))
+        srcs.append(torch.from_numpy(st.src) + off)
+        dsts.append(torch.from_numpy(st.dst) + off)
+        off += len(st.tx_ids)
+    x, y = torch.cat(xs), torch.cat(ys)
+    edge_index = to_undirected(torch.stack([torch.cat(srcs), torch.cat(dsts)]), num_nodes=off)
+    n_train, n_eval = int(train_ratio * off), int(eval_ratio * off)
+    print(f"elliptic labelled nodes {off}, undirected edges {edge_index.size(1) // 2}; "
+          f"train nodes {n_train}, future (validation-period) nodes {n_eval}")
+
+    def part(lo, hi):
+        ei, _ = subgraph(torch.arange(lo, hi), edge_index, relabel_nodes=True, num_nodes=off)
+        return Data(x=x[lo:hi], edge_index=ei, y=y[lo:hi])
+
+    data = part(0, n_train)
+    fut = part(n_train, n_train + n_eval)
+    g = torch.Generator().manual_seed(seed)
+    und = fut.edge_index[:, fut.edge_index[0] < fut.edge_index[1]]
+    perm = und[:, torch.randperm(und.size(1), generator=g)]
+    k = int(future_holdout * perm.size(1))
+    torch.manual_seed(seed)
+    data.future_x = fut.x
+    data.future_msg_edge_index = to_undirected(perm[:, k:], num_nodes=fut.num_nodes)
+    data.future_pos_edge_index = perm[:, :k]
+    data.future_neg_edge_index = negative_sampling(fut.edge_index, num_nodes=fut.num_nodes, num_neg_samples=k)
+    return data
+
+
 def load_dataset(dataset):
     if dataset=="elliptic":
         data_dir = str(paths.graph_file("elliptic_bitcoin_dataset"))
@@ -247,16 +317,29 @@ def main(argv=None):
     parser.add_argument("--dataset", default="elliptic")
     parser.add_argument("--val-ratio", type=float, default=0.05)
     parser.add_argument("--test-ratio", type=float, default=0.1)
+    parser.add_argument("--inductive", action="store_true",
+                        help="elliptic: fixed node ids, all 49 timesteps, train-split nodes only (+ future-period eval)")
+    parser.add_argument("--train-ratio", type=float, default=0.7)
+    parser.add_argument("--whole", action="store_true",
+                        help="elliptic: whole graph (all 49 timesteps, labelled + unknown nodes, fixed node ids)")
     args = parser.parse_args(argv)
 
-    data = load_dataset(args.dataset)
+    if args.whole:
+        assert args.dataset == "elliptic", "--whole is implemented for elliptic"
+        data = load_elliptic_whole()
+    elif args.inductive:
+        assert args.dataset == "elliptic", "--inductive is implemented for elliptic"
+        data = load_elliptic_inductive(train_ratio=args.train_ratio)
+    else:
+        data = load_dataset(args.dataset)
     print("data:", data)
     # NOTE: the released script stopped here and never wrote the file that
     # gae_train expects. We add the edge split + save so the pipeline is runnable.
     data = train_test_split_edges(data, val_ratio=args.val_ratio, test_ratio=args.test_ratio)
     # dense N x N bool mask (2 GB on elliptic), never read by gae_train
     del data.train_neg_adj_mask
-    out = paths.ensure(paths.gae_data_dir() / f"{args.dataset}_gae.pt")
+    tag = "_whole" if args.whole else "_inductive" if args.inductive else ""
+    out = paths.ensure(paths.gae_data_dir() / f"{args.dataset}{tag}_gae.pt")
     torch.save(data, out)
     print("saved:", out)
 
