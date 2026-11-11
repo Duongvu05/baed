@@ -85,6 +85,27 @@ def load_elliptic_data(data_dir, start_ts, end_ts):
     return [(s.src, s.dst) for s in steps], [s.features for s in steps], [s.classes for s in steps]
 
 
+def sparse_edge_split(data, val_ratio=0.05, test_ratio=0.1, seed=0):
+    """Same fields as ``train_test_split_edges`` without its dense N x N negative mask
+    (41 GB on the whole Elliptic graph): positives split on the undirected edges, negatives
+    drawn with ``negative_sampling`` against all edges."""
+    from torch_geometric.utils import negative_sampling, to_undirected
+
+    n = data.num_nodes
+    ei = data.edge_index
+    und = ei[:, ei[0] < ei[1]]
+    g = torch.Generator().manual_seed(seed)
+    und = und[:, torch.randperm(und.size(1), generator=g)]
+    nv, nt = int(val_ratio * und.size(1)), int(test_ratio * und.size(1))
+    data.val_pos_edge_index, data.test_pos_edge_index = und[:, :nv], und[:, nv:nv + nt]
+    data.train_pos_edge_index = to_undirected(und[:, nv + nt:], num_nodes=n)
+    torch.manual_seed(seed)
+    neg = negative_sampling(ei, num_nodes=n, num_neg_samples=nv + nt, force_undirected=False)
+    data.val_neg_edge_index, data.test_neg_edge_index = neg[:, :nv], neg[:, nv:nv + nt]
+    data.edge_index = None
+    return data
+
+
 def load_elliptic_whole():
     """The whole Elliptic graph for pre-training the guidance encoder (link prediction, no labels).
 
@@ -335,9 +356,13 @@ def main(argv=None):
     print("data:", data)
     # NOTE: the released script stopped here and never wrote the file that
     # gae_train expects. We add the edge split + save so the pipeline is runnable.
-    data = train_test_split_edges(data, val_ratio=args.val_ratio, test_ratio=args.test_ratio)
-    # dense N x N bool mask (2 GB on elliptic), never read by gae_train
-    del data.train_neg_adj_mask
+    if args.whole or args.inductive:
+        data = sparse_edge_split(data, val_ratio=args.val_ratio, test_ratio=args.test_ratio)
+    else:
+        data = train_test_split_edges(data, val_ratio=args.val_ratio, test_ratio=args.test_ratio)
+        # dense N x N bool mask (2 GB on elliptic), never read by gae_train
+        del data.train_neg_adj_mask
+    print("split:", data)
     tag = "_whole" if args.whole else "_inductive" if args.inductive else ""
     out = paths.ensure(paths.gae_data_dir() / f"{args.dataset}{tag}_gae.pt")
     torch.save(data, out)
