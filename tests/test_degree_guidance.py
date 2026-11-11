@@ -117,3 +117,41 @@ def test_gin_encoder_link_prediction_interface():
     assert torch.isfinite(loss)
     model.eval()
     assert model.encode(torch.randn(1, F), torch.zeros(2, 0, dtype=torch.long)).shape == (1, EMB)  # single node
+
+
+def test_gin_guided_denoiser_train_and_sample(tmp_path, monkeypatch):
+    """TGNN_gin_guided: e_t = GIN(X, A^t) every step, guidance e_0 / passed vector, all pairs predicted."""
+    from torch_geometric.nn import GAE
+
+    from baed import paths
+    from baed.gae.encoder import GINEncoder
+
+    torch.manual_seed(0)
+    torch.save(GAE(GINEncoder(F, EMB)), tmp_path / "gin.pt")
+    monkeypatch.setattr(paths, "gae_weight", lambda name: tmp_path / name)
+    gae = FakeGAE()
+    graphs = ego_graphs()
+    data = [preprocess(g, gae, device="cpu", degree=False) for g in graphs]
+    sampler = EmpiricalEmptyGraphGenerator(data, gae, device="cpu", degree=False,
+                                           augment_features=["label", "feature"] + [f"feature{i}" for i in range(F)])
+    args = Namespace(
+        dataset="elliptic", arch="TGNN_gin_guided", parametrization="x0", loss_type="vb_kl", degree=False,
+        max_degree=4, num_node_classes=2, num_edge_classes=2, diffusion_dim=16, diffusion_steps=128,
+        num_heads=[2, 1], dp_rate=0.0, norm="None", augmented_feature_dict={}, has_node_feature=False,
+        final_prob_node=[1 - 1e-12, 1e-12], final_prob_edge=[1 - 1e-12, 1e-12], sample_time_method="uniform",
+        noise_schedule="linear", device="cpu", guidance_encoder="gin.pt",
+    )
+    model = get_model(args, initial_graph_sampler=sampler)
+    net = model._denoise_fn
+    assert not any("_encoder" in k for k in net.state_dict())  # frozen encoder is not checkpointed
+    model.train()
+    loss = -model.log_prob(collate_fn(data[:12])).sum()
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert net.hg_in[0].weight.grad.abs().sum() > 0 and net.z_in.weight.grad.abs().sum() > 0
+    assert all(p.grad is None for p in net._encoder.parameters())
+    model.eval()
+    with torch.no_grad():
+        out = model.sample(10, torch.randn(EMB))
+    assert out.num_graphs == 10
+    assert (out.batch[out.edge_index[0]] == out.batch[out.edge_index[1]]).all()

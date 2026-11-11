@@ -45,6 +45,13 @@ def get_model(args, initial_graph_sampler):
         assert args.parametrization in ('x0', 'xt')
         dynamics_fn = TGNN_embedding_guided
         diffusion_fn = BinomialDiffusionVanilla
+    elif args.arch == 'TGNN_gin_guided':
+        # paper Eq. 14 / Algorithm 2: p(A^{t-1} | A^t, h_g), e_t = f(X, A^t) from the frozen GIN,
+        # every candidate edge predicted (no degree prescription)
+        assert args.parametrization in ('x0', 'xt')
+        assert getattr(args, 'guidance_encoder', None), '--guidance_encoder is required'
+        dynamics_fn = TGNN_gin_guided
+        diffusion_fn = BinomialDiffusionVanilla
     elif args.arch == 'TGNN_degree_embedding_guided':
         # degree-guided EDGE branch + per-graph anomaly guidance (what the README command asks for:
         # embedding guidance with xt_prescribed_st, which the released get_model() rejects)
@@ -81,6 +88,7 @@ def get_model(args, initial_graph_sampler):
             augmented_features=args.augmented_feature_dict,
             return_node_class = args.has_node_feature,
             guidance_dim=embedding_dim if args.arch == 'TGNN_degree_embedding_guided' else 0,
+            guidance_encoder=getattr(args, 'guidance_encoder', None),
     )
 
     if args.noise_schedule == 'cosine':

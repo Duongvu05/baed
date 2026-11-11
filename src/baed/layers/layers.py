@@ -659,3 +659,97 @@ class TGNN_embedding_guided(torch.nn.Module):
         edge_emb = nodes_repeated[row] + nodes_repeated[col]
         edge_class = self.final_out(edge_emb)
         return pyg_data.log_node_attr, edge_class
+
+class TGNN_gin_guided(torch.nn.Module):
+    """Denoiser p_theta(A^{t-1} | A^t, h_g) of paper Eq. 14 / Algorithm 2, without degree prescription.
+
+    At every step the frozen, pre-trained guidance encoder (GIN, link-prediction pre-training)
+    encodes the current noisy ego-graph with its node features, z_t = f(X, A^t), and pools it per
+    graph, e_t = maxpool(z_t) (Algorithm 2: "ego-graph embedding function e_t = f_theta(A_t)").
+    The guidance h_g is e_0 = maxpool f(X, A^0) of the clean graph while training, and the
+    weighted anomaly embedding of Eq. 18 passed to ``sample`` at generation time.
+
+    Node input: [z_t(v), degree_t(v), e_t, h_g] -> message passing on A^t with time embedding,
+    GRU update and per-graph context (as the released TGNN) -> a logit pair for every candidate
+    edge (u, v) of the graph, from the symmetric pair feature [z_u + z_v, z_u * z_v].
+    The released ``TGNN_embedding_guided`` pooled over the whole batch and mapped node ids modulo
+    256; here every pooling is per graph.
+    """
+
+    def __init__(self, max_degree, num_node_classes, num_edge_classes, dim, num_steps, num_heads=[4, 4, 4, 1],
+                 dropout=0., norm='None', guidance_encoder=None, embedding_dim=256, **kwargs) -> None:
+        super().__init__()
+        assert guidance_encoder, "TGNN_gin_guided needs --guidance_encoder (weights/gae/<file>)"
+        enc = torch.load(str(paths.gae_weight(guidance_encoder)), map_location="cpu", weights_only=False)
+        enc.eval()
+        for p in enc.parameters():
+            p.requires_grad_(False)
+        object.__setattr__(self, "_encoder", enc)  # frozen, not a sub-module: not trained, not checkpointed
+        self.max_degree = max_degree
+        self.num_classes = num_edge_classes
+        self.num_heads = num_heads
+        self.dim = dim
+        self.z_in = torch.nn.Linear(embedding_dim, dim)
+        self.deg_in = torch.nn.Linear(1, dim)
+        self.et_in = torch.nn.Linear(embedding_dim, dim)
+        self.hg_in = torch.nn.Sequential(torch.nn.Linear(embedding_dim, dim), torch.nn.SiLU(), torch.nn.Linear(dim, dim))
+        self.node_in = torch.nn.Sequential(torch.nn.Linear(dim * 4, dim), torch.nn.SiLU())
+        self.time_pos_emb = SinusoidalPosEmb(dim, num_steps=num_steps)
+        self.mlp = torch.nn.Sequential(torch.nn.Linear(dim, dim * 4), torch.nn.SiLU(), torch.nn.Linear(dim * 4, dim))
+        self.global_mlp = torch.nn.Sequential(torch.nn.Linear(dim, dim * 4), torch.nn.SiLU(), torch.nn.Linear(dim * 4, dim))
+        self.context_mlp = torch.nn.Sequential(torch.nn.Linear(dim * 2, dim * 4), torch.nn.SiLU(), torch.nn.Linear(dim * 4, dim))
+        self.dropout = torch.nn.Dropout(p=dropout)
+        self.gru = torch.nn.GRU(dim, dim)
+        self.layers = torch.nn.ModuleDict()
+        for i, num_head in enumerate(num_heads):
+            self.layers[f'time{i}'] = TimeEmb(dim, dim, Mish())
+            self.layers[f'conv{i}'] = pyg.nn.TransformerConv(in_channels=dim * 2, out_channels=dim, heads=num_head, concat=False)
+            self.layers[f'norm{i}'] = norm_dict[norm](dim)
+            self.layers[f'act{i}'] = torch.nn.SiLU()
+        self.node_out = torch.nn.Sequential(torch.nn.Linear(dim * 5, dim * 2), torch.nn.SiLU(), torch.nn.Linear(dim * 2, dim))
+        self.final_out = torch.nn.Sequential(torch.nn.Linear(dim * 2, dim * 2), torch.nn.SiLU(),
+                                             torch.nn.Linear(dim * 2, dim), torch.nn.SiLU(), torch.nn.Linear(dim, self.num_classes))
+
+    @torch.no_grad()
+    def _encode(self, x, edge_index):
+        enc = self._encoder
+        if next(enc.parameters()).device != x.device:
+            enc.to(x.device)
+        enc.eval()
+        return enc.encode(x.float(), edge_index)
+
+    def forward(self, pyg_data, t_node, t_edge, embedding=None):
+        n = pyg_data.num_nodes
+        batch = pyg_data.batch
+        b = int(batch.max()) + 1 if n else 0
+        edge_attr_t = pyg_data.log_full_edge_attr_t.argmax(-1)
+        e = pyg_data.full_edge_index[:, edge_attr_t.nonzero(as_tuple=True)[0]]
+        edge_index = torch.cat([e, e.flip(0)], dim=-1)  # A^t, both directions
+
+        z_t = self._encode(pyg_data.feature, edge_index)  # f(X, A^t) per node
+        e_t = torch_scatter.scatter(z_t, batch, dim=0, dim_size=b, reduce='max')  # per-graph e_t
+        if embedding is not None:  # generation: guidance of Eq. 18 (one vector, or one per graph)
+            h_g = embedding.detach().to(z_t.device, torch.float)
+            h_g = h_g.expand(b, -1) if h_g.dim() == 1 else h_g
+        else:  # training: e_0 of the clean graph, Algorithm 2 line 3
+            h_g = torch_scatter.scatter(pyg_data.embedding.detach().float(), batch, dim=0, dim_size=b, reduce='max')
+        deg = pyg.utils.degree(edge_index[0], num_nodes=n).clamp(max=self.max_degree + 1)[:, None] / self.max_degree
+
+        node_feats = [self.z_in(z_t), self.deg_in(deg), self.et_in(e_t)[batch], self.hg_in(h_g)[batch]]
+        h = self.node_in(torch.cat(node_feats, dim=-1))
+        t = self.mlp(self.time_pos_emb(t_node))
+        state = h.unsqueeze(0)
+        ctx = self.global_mlp(torch_scatter.scatter(h, batch, dim=0, dim_size=b, reduce='mean'))[batch]
+        for i in range(len(self.num_heads)):
+            h = torch.cat([h, self.layers[f'time{i}'](t)], dim=-1)
+            h = self.layers[f'conv{i}'](h, edge_index)
+            h = self.dropout(self.layers[f'act{i}'](self.layers[f'norm{i}'](h)))
+            h, state = self.gru(h.unsqueeze(0).contiguous(), state.contiguous())
+            h = h.squeeze(0)
+            node_ctx = self.context_mlp(torch.cat([h, ctx], dim=-1))
+            ctx = self.global_mlp(torch_scatter.scatter(ctx + node_ctx, batch, dim=0, dim_size=b, reduce='mean'))[batch]
+            h = h + ctx
+        z = self.node_out(torch.cat([h] + node_feats, dim=-1))
+        row, col = pyg_data.full_edge_index
+        edge_class = self.final_out(torch.cat([z[row] + z[col], z[row] * z[col]], dim=-1))
+        return pyg_data.log_node_attr, edge_class

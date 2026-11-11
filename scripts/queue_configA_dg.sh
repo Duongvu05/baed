@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Config A, +BAED with the degree-guided + anomaly-guided diffusion (arch TGNN_degree_embedding_guided),
-# guidance embeddings from a GIN encoder pre-trained by link prediction (paper Sec. 4.3).
+# Config A, +BAED with the anomaly-guided diffusion of paper Eq. 14-16 / Algorithm 2 (arch TGNN_gin_guided):
+# denoiser p(A^{t-1} | A^t, h_g) with e_t = GIN(X, A^t), guidance from a GIN pre-trained by link prediction
+# on the whole graph (Sec. 4.3), exact ELBO (x0 / vb_kl: L_recon + L_con + L_prior), t ~ U[1, T].
 #   1. train the diffusion on train-split anomalies (300 epochs, paper App. D), run elliptic_fulltrain_dg
 #   2. +BAED for GCN, BWGNN, GraphSAGE, BernNet (seed 15, one lr per model, as in queue_configA.sh)
 set -u
@@ -8,7 +9,7 @@ cd "$(dirname "$0")/.."
 export PATH=/home/data/.local/bin:$PATH DGLBACKEND=pytorch
 ENC="${ENC:-elliptic_gin_relu_256_whole.pt}"  # guidance encoder: GIN pre-trained by link prediction on the whole graph
 TS="${TS:-uniform}"  # diffusion step sampling, paper Algorithm 2: t ~ U[1, T]
-RUN="${RUN:-elliptic_fulltrain_dg_ginwhole}"; CK="${CK:-300}"; SEED="${SEED:-15}"
+RUN="${RUN:-elliptic_fulltrain_gin_et}"; CK="${CK:-300}"; SEED="${SEED:-15}"
 R=outputs/results/elliptic/configA_dg; L=outputs/logs/elliptic/configA_dg
 mkdir -p "$R" "$L"
 declare -A LR=([GCN]=0.001 [BWGNN]=0.0001 [GraphSAGE]=0.001 [BernNet]=0.001)
@@ -29,9 +30,9 @@ if [ ! -s outputs/runs/elliptic/multinomial_diffusion/multistep/$RUN/check/check
     --epochs "$CK" --num_generation 64 --diffusion_dim 64 --diffusion_steps 128 \
     --device cuda:0 --dataset elliptic --batch_size 8 --clip_value 1 --lr 1e-4 --optimizer adam \
     --final_prob_edge 1 0 --sample_time_method "$TS" --check_every 10 --eval_every 10 \
-    --noise_schedule linear --dp_rate 0.1 --loss_type vb_ce_xt_prescribred_st \
-    --arch TGNN_degree_embedding_guided --parametrization xt_prescribed_st --empty_graph_sampler empirical \
-    --degree --num_heads 8 8 8 8 1 --log_wandb False --guidance_encoder "$ENC" > "$L/diffusion_$RUN.log" 2>&1 || { log "FAILED diffusion"; exit 1; }
+    --noise_schedule linear --dp_rate 0.1 --loss_type vb_kl \
+    --arch TGNN_gin_guided --parametrization x0 --empty_graph_sampler empirical \
+    --num_heads 8 8 8 8 1 --log_wandb False --guidance_encoder "$ENC" > "$L/diffusion_$RUN.log" 2>&1 || { log "FAILED diffusion"; exit 1; }
   log "diffusion done"
 fi
 
