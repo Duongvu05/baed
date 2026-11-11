@@ -67,7 +67,9 @@ def preprocess(g,model,device,degree=False, augmented_features=[]):
         pyg_data.node_attr = torch.zeros(pyg_data.num_nodes, dtype=torch.long)
 
     if degree:
-        pyg_data.degree = pyg.utils.degree(pyg_data.edge_index[0]).long() # make sure edge_index is bi-directional
+        # num_nodes: without it a single-node graph gets an empty degree vector and the batched
+        # degree tensor is shifted against the nodes (released bug). edge_index is bi-directional.
+        pyg_data.degree = pyg.utils.degree(pyg_data.edge_index[0], num_nodes=pyg_data.num_nodes).long()
     # 提取节点的feature和label
     features=pyg_data.feature
     # 检查类型

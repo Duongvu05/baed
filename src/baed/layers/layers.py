@@ -259,18 +259,34 @@ class TGNN(torch.nn.Module):
         return pyg_data.log_node_attr, edge_class
 
 class TGNN_degree_guided(torch.nn.Module):
-    def __init__(self, max_degree, num_node_classes, num_edge_classes, dim, num_steps, num_heads=[4, 4, 4, 1], dropout=0., norm='None', degree=False, augmented_features={}, **kwargs) -> None:
+    """EDGE degree-guided denoiser.
+
+    ``guidance_dim > 0`` adds BAED's anomaly guidance to the degree-guided branch: a per-graph
+    vector (the max-pooled GAE embedding of the graph during training, or the guidance
+    embedding passed to ``sample`` at generation time) is projected to ``dim`` and fed to every
+    node of its graph, next to the degree inputs. ``guidance_dim = 0`` is the released EDGE model.
+    """
+
+    def __init__(self, max_degree, num_node_classes, num_edge_classes, dim, num_steps, num_heads=[4, 4, 4, 1], dropout=0., norm='None', degree=False, augmented_features={}, guidance_dim=0, **kwargs) -> None:
         super().__init__()
         self.max_degree = max_degree
         self.num_classes = num_edge_classes
-        self.num_heads = num_heads 
+        self.num_heads = num_heads
         self.dim = dim
         self.num_steps = num_steps
+        self.guidance_dim = guidance_dim
+        n_in = 4 if guidance_dim else 3
+        if guidance_dim:
+            self.guide = torch.nn.Sequential(
+                torch.nn.Linear(guidance_dim, dim),
+                torch.nn.SiLU(),
+                torch.nn.Linear(dim, dim),
+            )
         self.embedding_t = torch.nn.Linear(1, dim)
         self.embedding_0 = torch.nn.Linear(1, dim)
         self.embedding_sel = torch.nn.Embedding(2, dim)
         self.node_in = torch.torch.nn.Sequential(
-            torch.nn.Linear(dim * 3, dim),
+            torch.nn.Linear(dim * n_in, dim),
             torch.nn.SiLU()
         )
         self.time_pos_emb = SinusoidalPosEmb(dim, num_steps=num_steps)
@@ -309,13 +325,13 @@ class TGNN_degree_guided(torch.nn.Module):
         self.dummy_edge_feats = torch.nn.parameter.Parameter(torch.randn(dim))
 
         self.node_out_mlp = torch.nn.Sequential(
-            torch.nn.Linear(dim*4, dim * 2),
+            torch.nn.Linear(dim * (n_in + 1), dim * 2),
             torch.nn.SiLU(),
             torch.nn.Linear(dim * 2, dim*2),
             torch.nn.SiLU(),
             torch.nn.Linear(dim*2, dim*2)
         )
-        
+
         self.final_out = torch.nn.Sequential(
             torch.nn.Linear(dim*2, dim * 2),
             torch.nn.SiLU(),
@@ -323,8 +339,21 @@ class TGNN_degree_guided(torch.nn.Module):
             torch.nn.SiLU(),
             torch.nn.Linear(dim, self.num_classes)
         )
-        
-    def forward(self, pyg_data, t_node, t_edge):
+
+    def _guidance(self, pyg_data, embedding):
+        """Per-node guidance features ``[num_nodes, dim]`` (one vector per graph)."""
+        num_graphs = int(pyg_data.batch.max()) + 1 if pyg_data.num_nodes else 0
+        if embedding is not None:  # generation: one vector for the batch, or one per graph
+            g = embedding.to(pyg_data.batch.device, torch.float)
+            g = g.expand(num_graphs, -1) if g.dim() == 1 else g
+        elif hasattr(pyg_data, 'embedding') and pyg_data.embedding is not None:
+            # training: max-pooled GAE embedding of each clean graph (same pooling as the guidance)
+            g = torch_scatter.scatter(pyg_data.embedding.float(), pyg_data.batch, dim=0, dim_size=num_graphs, reduce='max')
+        else:
+            g = torch.zeros(num_graphs, self.guidance_dim, device=pyg_data.batch.device)
+        return self.guide(g)[pyg_data.batch]
+
+    def forward(self, pyg_data, t_node, t_edge, embedding=None):
         if hasattr(pyg_data, 'edge_index_t'):
             edge_index = pyg_data.edge_index_t
         else: 
@@ -343,9 +372,10 @@ class TGNN_degree_guided(torch.nn.Module):
         nodes_0 = pyg_data.degree[..., None] / self.max_degree
         node_selection[pyg_data.active_node_indices] = 1
         node_selection = node_selection.long()
-        nodes = torch.cat([self.embedding_t(nodes_t), self.embedding_0(nodes_0), self.embedding_sel(node_selection)], dim=-1)
-        # print("nodes:",nodes.shape)
-        nodes = self.node_in(nodes)
+        node_feats = [self.embedding_t(nodes_t), self.embedding_0(nodes_0), self.embedding_sel(node_selection)]
+        if self.guidance_dim:
+            node_feats.append(self._guidance(pyg_data, embedding))
+        nodes = self.node_in(torch.cat(node_feats, dim=-1))
 
         t = self.time_pos_emb(t_node)
         t = self.mlp(t)
@@ -389,12 +419,11 @@ class TGNN_degree_guided(torch.nn.Module):
         row = pyg_data.full_edge_index[0].index_select(0, pyg_data.active_edge_indices)
         col = pyg_data.full_edge_index[1].index_select(0, pyg_data.active_edge_indices)
 
-        nodes = torch.cat([nodes, self.embedding_t(nodes_t), self.embedding_0(nodes_0), self.embedding_sel(node_selection)], dim=-1)
-        nodes = self.node_out_mlp(nodes)
+        nodes = self.node_out_mlp(torch.cat([nodes] + node_feats, dim=-1))
 
         edge_emb = nodes[row] + nodes[col]
         edge_class = self.final_out(edge_emb)
-        
+
         return pyg_data.log_node_attr, edge_class
 
 

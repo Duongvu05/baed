@@ -45,6 +45,13 @@ def get_model(args, initial_graph_sampler):
         assert args.parametrization in ('x0', 'xt')
         dynamics_fn = TGNN_embedding_guided
         diffusion_fn = BinomialDiffusionVanilla
+    elif args.arch == 'TGNN_degree_embedding_guided':
+        # degree-guided EDGE branch + per-graph anomaly guidance (what the README command asks for:
+        # embedding guidance with xt_prescribed_st, which the released get_model() rejects)
+        assert args.parametrization == 'xt_prescribed_st'
+        assert args.degree, '--degree is required: the prescribed degrees drive node activation'
+        dynamics_fn = TGNN_degree_guided
+        diffusion_fn = BinomialDiffusionActive
     else:
         raise NotImplementedError()
     embedding_dim=0
@@ -72,7 +79,8 @@ def get_model(args, initial_graph_sampler):
             gru=True,
             degree=args.degree,
             augmented_features=args.augmented_feature_dict,
-            return_node_class = args.has_node_feature
+            return_node_class = args.has_node_feature,
+            guidance_dim=embedding_dim if args.arch == 'TGNN_degree_embedding_guided' else 0,
     )
 
     if args.noise_schedule == 'cosine':

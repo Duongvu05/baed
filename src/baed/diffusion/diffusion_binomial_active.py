@@ -70,13 +70,14 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         return batched_graph
          
     @torch.no_grad()
-    def p_sample(self, batched_graph, t_node, t_edge):
+    def p_sample(self, batched_graph, t_node, t_edge, embedding=None):
+        # embedding: guidance passed by DiffusionBase.sample (None for the plain EDGE model)
         self._p_sample_and_set_actives(batched_graph, t_node)
         assert hasattr(batched_graph, 'active_node_indices')
         assert hasattr(batched_graph, 'active_edge_indices')
         if batched_graph.active_edge_indices.size(0) == 0:
             return batched_graph.log_node_attr_t, batched_graph.log_full_edge_attr_t
-        log_model_prob_node, log_model_prob_edge = self._p_pred(batched_graph, t_node, t_edge)
+        log_model_prob_node, log_model_prob_edge = self._p_pred(batched_graph, t_node, t_edge, embedding)
 
         assert log_model_prob_edge.size(0) == batched_graph.active_edge_indices.size(0)
 
@@ -151,8 +152,11 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             active_node_masks[batched_graph.full_edge_index[1]])
 
     # 去噪 预测xt-1, 这当中会用到s_t    st := ✶[dt−1 = dt] is a binary vector indicating whether nodes are active (having degree change from t − 1 to t) or not from t − 1 to t. 
-    def _predict_xtmin1_given_xt_st(self, batched_graph, t_node, t_edge):
-        out_node, out_edge = self._denoise_fn(batched_graph, t_node, t_edge)
+    def _predict_xtmin1_given_xt_st(self, batched_graph, t_node, t_edge, embedding=None):
+        if embedding is None:  # keeps the released EDGE denoiser (no embedding argument) usable
+            out_node, out_edge = self._denoise_fn(batched_graph, t_node, t_edge)
+        else:
+            out_node, out_edge = self._denoise_fn(batched_graph, t_node, t_edge, embedding)
 
         assert out_node.size(1) == self.num_node_classes
         assert out_edge.size(1) == self.num_edge_classes
@@ -187,11 +191,11 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         loss = loss_node + loss_edge
         return loss    
 
-    def _p_pred(self, batched_graph, t_node, t_edge):
+    def _p_pred(self, batched_graph, t_node, t_edge, embedding=None):
         if self.parametrization in ['x0', 'xt']:
-            return super(BinomialDiffusionActive, self)._p_pred(batched_graph, t_node, t_edge)
+            return super(BinomialDiffusionActive, self)._p_pred(batched_graph, t_node, t_edge, embedding)
         elif self.parametrization == 'xt_prescribed_st':
-            log_model_pred_node, log_model_pred_edge = self._predict_xtmin1_given_xt_st(batched_graph, t_node=t_node, t_edge=t_edge) 
+            log_model_pred_node, log_model_pred_edge = self._predict_xtmin1_given_xt_st(batched_graph, t_node=t_node, t_edge=t_edge, embedding=embedding)
             return log_model_pred_node, log_model_pred_edge
         elif self.parametrization == 'xt_st':
             pass # TODO
