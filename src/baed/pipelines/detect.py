@@ -472,6 +472,19 @@ def _guidance(gae, feats, edges, labels, losses):
 
 
 @torch.no_grad()
+def _current_losses(detector, feats, edges, labels):
+    """{position in batch: cross-entropy loss} of the current detector on the real ego-graphs."""
+    bg, y, pos = _batch(feats, edges, labels)
+    if bg is None:
+        return {}
+    was_training = detector.training
+    detector.eval()
+    loss = F.cross_entropy(detector(bg).reshape(-1, 2), y, reduction='none')
+    detector.train(was_training)
+    return dict(zip(pos, loss.cpu().tolist()))
+
+
+@torch.no_grad()
 def test_batched(detector, test_loader, model_path):
     detector.load_state_dict(torch.load(model_path, map_location=device))
     detector.eval()
@@ -501,7 +514,6 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
                   use_baed, withcondition, run_tag, eval_loader=None):
     model_path = str(paths.ensure(paths.root() / "outputs" / "detect_weights" /
                                   f"{dataset}_{detector.modelName}_{'BAED' if use_baed else 'None'}_{run_tag}.pth"))
-    prev_losses = {}  # batch index -> {position in batch: loss}, used for the guidance weights
     best = float('inf')
     for epoch in range(num_epochs):
         AUG["progress"] = (epoch + 1) / num_epochs
@@ -513,7 +525,13 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
             feats, edges, labels = list(data.subFeature), list(data.sub_edge_index), data.sub_label
             n_norm, n_anom = int((labels == 0).sum()), int((labels == 1).sum())
             if use_baed and n_anom < n_norm:
-                emb = _guidance(gae, feats, edges, labels, prev_losses.get(b) if epoch else None) if withcondition else None
+                # paper Eq. 17: l_i is the detection loss of the i-th anomaly of THIS batch. The released
+                # code looked losses up by (batch number, position) from the previous epoch, but the train
+                # loader is shuffled, so those losses belonged to other samples. Here l_i is the loss of the
+                # current detector (before this step's update) on the batch's own real ego-graphs.
+                # Epoch 0 keeps the average weights (Algorithm 3, line 10).
+                emb = _guidance(gae, feats, edges, labels, _current_losses(detector, feats, edges, labels)
+                                if epoch else None) if withcondition else None
                 diff = n_norm - n_anom
                 gfeat, gedge = generator.generate_arrays(diff, feats[0].size(1), embedding=emb)
                 if AUG["gen_noise"] > 0:  # paper: synthetic features = original values + N(0, 1)
@@ -530,7 +548,6 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            prev_losses[b] = dict(zip(pos, loss_each.detach().cpu().tolist()))
             tot += float(loss_each.sum())
             cnt += len(pos)
         avg = tot / max(cnt, 1)
