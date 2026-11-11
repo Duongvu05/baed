@@ -63,12 +63,15 @@ def test_train_loss_and_guided_sampling():
     torch.manual_seed(0)
     gae = FakeGAE()
     data, model = build(gae, ego_graphs())
-    batch = collate_fn(data[:8])
     model.train()
-    loss = -model.log_prob(batch).sum()
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert model._denoise_fn.guide[0].weight.grad.abs().sum() > 0  # guidance reaches the loss
+    # a random t often has no active edge in such small graphs: accumulate over a few steps
+    for _ in range(30):
+        loss = -model.log_prob(collate_fn(data[8:])).sum()
+        assert torch.isfinite(loss)
+        if loss.requires_grad:
+            loss.backward()
+    grad = model._denoise_fn.guide[0].weight.grad
+    assert grad is not None and grad.abs().sum() > 0  # guidance reaches the loss
 
     model.eval()
     with torch.no_grad():
