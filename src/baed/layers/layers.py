@@ -344,11 +344,12 @@ class TGNN_degree_guided(torch.nn.Module):
         """Per-node guidance features ``[num_nodes, dim]`` (one vector per graph)."""
         num_graphs = int(pyg_data.batch.max()) + 1 if pyg_data.num_nodes else 0
         if embedding is not None:  # generation: one vector for the batch, or one per graph
-            g = embedding.to(pyg_data.batch.device, torch.float)
+            g = embedding.detach().to(pyg_data.batch.device, torch.float)
             g = g.expand(num_graphs, -1) if g.dim() == 1 else g
         elif hasattr(pyg_data, 'embedding') and pyg_data.embedding is not None:
             # training: max-pooled GAE embedding of each clean graph (same pooling as the guidance)
-            g = torch_scatter.scatter(pyg_data.embedding.float(), pyg_data.batch, dim=0, dim_size=num_graphs, reduce='max')
+            # detach: the GAE is pre-trained and frozen, its embeddings are inputs only
+            g = torch_scatter.scatter(pyg_data.embedding.detach().float(), pyg_data.batch, dim=0, dim_size=num_graphs, reduce='max')
         else:
             g = torch.zeros(num_graphs, self.guidance_dim, device=pyg_data.batch.device)
         return self.guide(g)[pyg_data.batch]
