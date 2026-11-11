@@ -65,6 +65,8 @@ def add_data_args(parser):
     parser.add_argument('--augmented_features', type=str, nargs="*", default=[])
     # ego-graph file suffix: data/graphs/<dataset><data_tag>_init_1_dataset.pkl (e.g. _fulltrain)
     parser.add_argument('--data_tag', type=str, default='')
+    # pre-trained guidance encoder (weights/gae/<file>); elliptic_gin_relu_256.pt = GIN of the paper
+    parser.add_argument('--guidance_encoder', type=str, default=None)
 
 def get_data_id(args):
     return '{}'.format(args.dataset)
@@ -146,7 +148,7 @@ def get_data(args):
 
         max_degree = max([max([d for n, d in train_nx_graph.degree()]) for train_nx_graph in train_nx_graphs])
         # # 加载GAE模型
-        model = torch.load(str(paths.gae_weight("elliptic_gae_relu_256.pt")))
+        model = torch.load(str(paths.gae_weight(getattr(args, 'guidance_encoder', None) or "elliptic_gae_relu_256.pt")))
         # 增加子图的节点特征属性
         featureNameList=["label","feature"]
         for i in range(166):

@@ -100,3 +100,20 @@ def test_guidance_changes_edge_logits():
         _, own = net(b, t_node, t_edge)  # training path: each graph's own pooled embedding
     assert a.shape == c.shape == own.shape == (b.full_edge_index.size(1), 2)
     assert not torch.allclose(a, c)
+
+
+def test_gin_encoder_link_prediction_interface():
+    from torch_geometric.nn import GAE
+
+    from baed.gae.encoder import GINEncoder
+
+    torch.manual_seed(0)
+    model = GAE(GINEncoder(F, EMB))
+    x, ei = torch.randn(6, F), torch.tensor([[0, 1, 1, 2, 3, 4], [1, 0, 2, 1, 4, 3]])
+    z = model.encode(x, ei)
+    assert z.shape == (6, EMB)
+    loss = model.recon_loss(z, ei)
+    loss.backward()
+    assert torch.isfinite(loss)
+    model.eval()
+    assert model.encode(torch.randn(1, F), torch.zeros(2, 0, dtype=torch.long)).shape == (1, EMB)  # single node

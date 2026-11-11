@@ -24,7 +24,9 @@ import os
 from dgl.data.utils import load_graphs, save_graphs
 from torch_geometric.utils import subgraph
 from baed import paths
-from baed.gae.encoder import GCNEncoder,VariationalGCNEncoder
+import copy
+
+from baed.gae.encoder import GCNEncoder, GINEncoder, VariationalGCNEncoder
 from torch_geometric.nn import VGAE
 
 
@@ -37,6 +39,8 @@ def load_data(filepath):
 def configure_model(data, out_channels=64, num_features=17,activation='relu',gae_type="GAE"):
     if gae_type=="gae":
         model = GAE(GCNEncoder(num_features, out_channels, activation=activation))
+    elif gae_type=="gin":  # paper Sec. 4.3 guidance encoder, same link-prediction pre-training
+        model = GAE(GINEncoder(num_features, out_channels, activation=activation))
     elif gae_type=="VGAE":
         model = VGAE(VariationalGCNEncoder(num_features, out_channels, activation=activation))  
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -71,7 +75,7 @@ def main(argv=None):
     parser.add_argument("--dataset", default="dgraph")
     parser.add_argument("--out-channels", type=int, default=64)
     parser.add_argument("--num-features", type=int, default=17)
-    parser.add_argument("--gae-type", default="VGAE", choices=["gae", "VGAE"])
+    parser.add_argument("--gae-type", default="VGAE", choices=["gae", "gin", "VGAE"])
     parser.add_argument("--activation", default="relu")
     parser.add_argument("--epochs", type=int, default=100)
     args = parser.parse_args(argv)
@@ -94,17 +98,20 @@ def main(argv=None):
     for epoch in range(1, epochs + 1):
         loss = train(model, optimizer, x, train_pos_edge_index)
         auc, ap = test(model, x, train_pos_edge_index, data.test_pos_edge_index, data.test_neg_edge_index)
-        print('Epoch: {:03d}, AUC: {:.4f}, AP: {:.4f}'.format(epoch, auc, ap))
-        if auc > best_auc:
-            best_auc = auc
-            best_model = model
+        val_auc, _ = test(model, x, train_pos_edge_index, data.val_pos_edge_index, data.val_neg_edge_index)
+        print('Epoch: {:03d}, val AUC: {:.4f}, test AUC: {:.4f}, AP: {:.4f}'.format(epoch, val_auc, auc, ap))
+        # select on validation edges; deepcopy (the released code kept a reference, i.e. the last epoch)
+        if val_auc > best_auc:
+            best_auc = val_auc
+            best_model = copy.deepcopy(model)
 
-    print("Best AUC:", best_auc)
+    print("Best val AUC:", best_auc)
     out = paths.ensure(paths.gae_weight(f'{dataset}_{gae_type}_{activation}_{out_channels}.pt'))
     torch.save(best_model, out)
     print("saved:", out)
     print("x:", x.size())
     print("train_pos_edge_index:", train_pos_edge_index.size())
+    best_model.eval()
     Z = best_model.encode(x, train_pos_edge_index)
     print("Z:", Z.size())
 
