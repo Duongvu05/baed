@@ -154,10 +154,10 @@ class BinomialDiffusionVanilla(DiffusionBase):
 
         # log_categorical就是通过交叉熵来计算 
         ce_prior_node = -log_categorical(log_qxT_prob_node, log_final_prob_node)
-        ce_prior_node = scatter(ce_prior_node, batched_graph.batch, dim=-1, reduce='sum')
+        ce_prior_node = scatter(ce_prior_node, batched_graph.batch, dim=-1, reduce='sum', dim_size=batched_graph.num_graphs)
 
         ce_prior_edge = -log_categorical(log_qxT_prob_edge, log_final_prob_edge)
-        ce_prior_edge = scatter(ce_prior_edge, batched_graph.batch[batched_graph.full_edge_index[0]], dim=-1, reduce='sum')
+        ce_prior_edge = scatter(ce_prior_edge, batched_graph.batch[batched_graph.full_edge_index[0]], dim=-1, reduce='sum', dim_size=batched_graph.num_graphs)
 
         # padding
         target_size = max(ce_prior_node.size(0), ce_prior_edge.size(0))
@@ -185,10 +185,10 @@ class BinomialDiffusionVanilla(DiffusionBase):
 
         # 这个是正经的交叉熵
         kl_prior_node = self.multinomial_kl(log_qxT_prob_node, log_final_prob_node)
-        kl_prior_node = scatter(kl_prior_node, batched_graph.batch, dim=-1, reduce='sum')
+        kl_prior_node = scatter(kl_prior_node, batched_graph.batch, dim=-1, reduce='sum', dim_size=batched_graph.num_graphs)
 
         kl_prior_edge = self.multinomial_kl(log_qxT_prob_edge, log_final_prob_edge)
-        kl_prior_edge = scatter(kl_prior_edge, batched_graph.batch[batched_graph.full_edge_index[0]], dim=-1, reduce='sum')
+        kl_prior_edge = scatter(kl_prior_edge, batched_graph.batch[batched_graph.full_edge_index[0]], dim=-1, reduce='sum', dim_size=batched_graph.num_graphs)
 
         kl_prior = kl_prior_node + kl_prior_edge
 
@@ -214,8 +214,8 @@ class BinomialDiffusionVanilla(DiffusionBase):
         loss_node = cross_ent_node + ent_node
         loss_edge = cross_ent_edge + ent_edge
 
-        loss_node = scatter(loss_node, batched_graph.batch, dim=-1, reduce='sum')
-        loss_edge = scatter(loss_edge, batched_graph.batch[batched_graph.full_edge_index[0]], dim=-1, reduce='sum') 
+        loss_node = scatter(loss_node, batched_graph.batch, dim=-1, reduce='sum', dim_size=batched_graph.num_graphs)
+        loss_edge = scatter(loss_edge, batched_graph.batch[batched_graph.full_edge_index[0]], dim=-1, reduce='sum', dim_size=batched_graph.num_graphs) 
         # 填充
         target_size = max(loss_node.size(0), loss_edge.size(0))
         if loss_node.size(0)<target_size:
@@ -240,19 +240,19 @@ class BinomialDiffusionVanilla(DiffusionBase):
         # 跟现有公示不太一样，得确认一下
         # 计算denoising matching term
         kl_node = self.multinomial_kl(log_true_prob_node, log_model_prob_node)
-        kl_node = scatter(kl_node, batched_graph.batch, dim=-1, reduce='sum')
+        kl_node = scatter(kl_node, batched_graph.batch, dim=-1, reduce='sum', dim_size=batched_graph.num_graphs)
         kl_edge = self.multinomial_kl(log_true_prob_edge, log_model_prob_edge)
-        kl_edge = scatter(kl_edge, batched_graph.batch[batched_graph.full_edge_index[0]], dim=-1, reduce='sum')
+        kl_edge = scatter(kl_edge, batched_graph.batch[batched_graph.full_edge_index[0]], dim=-1, reduce='sum', dim_size=batched_graph.num_graphs)
         kl = kl_node + kl_edge
 
         # 这个是计算reconstruction term，通过monte karlo计算
         # log_node_attr就是node特征的log，node特征默认为0
         decoder_nll_node = -log_categorical(batched_graph.log_node_attr, log_model_prob_node)
-        decoder_nll_node = scatter(decoder_nll_node, batched_graph.batch, dim=-1, reduce='sum')
+        decoder_nll_node = scatter(decoder_nll_node, batched_graph.batch, dim=-1, reduce='sum', dim_size=batched_graph.num_graphs)
         # log_full_edge_attr就是edge特征的log，edge存在为1，不存在为0
         # 因为第一步的变化特别少，所以q(x1|x0)，近似于q(x0)，所以直接用原始分布来计算期望
         decoder_nll_edge = -log_categorical(batched_graph.log_full_edge_attr, log_model_prob_edge)
-        decoder_nll_edge = scatter(decoder_nll_edge, batched_graph.batch[batched_graph.full_edge_index[0]], dim=-1, reduce='sum')
+        decoder_nll_edge = scatter(decoder_nll_edge, batched_graph.batch[batched_graph.full_edge_index[0]], dim=-1, reduce='sum', dim_size=batched_graph.num_graphs)
         decoder_nll = decoder_nll_node + decoder_nll_edge
 
         mask = (t == torch.zeros_like(t)).float()
