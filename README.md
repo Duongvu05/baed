@@ -70,7 +70,7 @@ Results go to `outputs/results/elliptic/unified/`.
 | Generator | GIN-guided ego-graph diffusion, run `elliptic_fulltrain_gin_et_b32` | `--run-name`, `--checkpoint 300` |
 | Synthetic node features | copied from the template ego-graph, no Gaussian noise | `--gen-noise 0` |
 | Guidance weights | paper Eq. 17 and 18 | `--curriculum sigmoid` |
-| Sampling | synthetic graphs of 16 batches in one diffusion call | `--gen-chunk 16` |
+| Sampling order | per batch, as in Algorithm 3 | `--gen-chunk 1` (default) |
 
 Why these choices differ from the paper text.
 
@@ -86,10 +86,12 @@ Why these choices differ from the paper text.
   function runs on real and generated ego-graphs, so message passing and the aggregate features use
   the same edge set. Node features become 467-dimensional. The guidance encoder and the diffusion
   still see the 166 released features.
-- **`--gen-chunk`.** Sampling is launch-bound (92 graphs take as long as 400). With K = 16 one epoch takes
-  about 12 s instead of 95 s on an RTX 3060. K = 1 reproduces the per-batch loop exactly (same epoch
-  losses and test metrics over 2 epochs). With K > 1 the guidance of the K batches uses the detector as it
-  is at the start of the chunk.
+- **`--gen-chunk` stays at 1.** Algorithm 3 computes the loss of the current batch, builds the guidance,
+  samples, and updates the detector before it moves to the next batch. K = 1 follows this order. With
+  K > 1 the synthetic graphs of K batches are sampled in one call, which is 5 to 8 times faster (sampling is
+  launch-bound, 92 graphs take as long as 400), but the guidance of all K batches is then computed before
+  the detector is updated on any of them. K > 1 is kept only for quick checks. A K = 1 run of GCN takes
+  about 75 min on an RTX 3060.
 
 GCN, seed 15, test set of 4350 ego-graphs with 116 frauds. F1 is the fraud class F1.
 
@@ -97,7 +99,12 @@ GCN, seed 15, test set of 4350 ego-graphs with 116 frauds. F1 is the fraud class
 |---|---|---|---|---|---|---|
 | Base | 0.689 | 0.058 | 0.060 | 0.521 | 0.919 | 0.758 |
 | +BAED, N(0, 1) noise | 0.653 | 0.040 | 0.009 | 0.492 | 0.897 | 0.666 |
-| +BAED, no noise | 0.700 | 0.051 | 0.012 | 0.497 | 0.908 | 0.727 |
+| +BAED, no noise (K = 1) | 0.756 | 0.061 | 0.039 | 0.511 | 0.904 | 0.676 |
+| +BAED, no noise (K = 16, approximate) | 0.700 | 0.051 | 0.012 | 0.497 | 0.908 | 0.727 |
+
+The two no-noise runs differ by about 0.05 in AUROC and in val macro F1. K = 16 changes the order in which
+random numbers are drawn, so this gap is mostly run-to-run variance. One seed is not enough to rank
+methods that are closer than that.
 
 ## What changed vs. upstream
 

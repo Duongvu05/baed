@@ -10,12 +10,13 @@
 #
 # Usage: MODEL=GCN SEEDS="15" bash scripts/run_baed_unified.sh
 #   runs base and +BAED for each seed. Steps already done (encoder, diffusion, result files) are skipped.
-#   GEN_CHUNK=1 reproduces the per-batch sampling loop exactly; 16 (default) is ~5-8x faster, the guidance
-#   of 16 consecutive batches then uses the detector at the start of the chunk.
+#   GEN_CHUNK=1 (default) follows Algorithm 3: loss of the current batch -> guidance -> sampling -> detector
+#   update, then the next batch. GEN_CHUNK=16 is ~5-8x faster but approximate: the guidance of 16 consecutive
+#   batches is computed before the detector is updated on any of them. Use it only for quick checks.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export DGLBACKEND=pytorch OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
-MODEL="${MODEL:-GCN}"; SEEDS="${SEEDS:-15}"; GEN_CHUNK="${GEN_CHUNK:-16}"
+MODEL="${MODEL:-GCN}"; SEEDS="${SEEDS:-15}"; GEN_CHUNK="${GEN_CHUNK:-1}"
 ENC="${ENC:-elliptic_gin_relu_256_whole.pt}"; RUN="${RUN:-elliptic_fulltrain_gin_et_b32}"; CK="${CK:-300}"
 declare -A LR=([GCN]=0.001 [BWGNN]=0.0001 [GraphSAGE]=0.001 [BernNet]=0.001)
 R=outputs/results/elliptic/unified; L=outputs/logs/elliptic/unified; mkdir -p "$R" "$L"
