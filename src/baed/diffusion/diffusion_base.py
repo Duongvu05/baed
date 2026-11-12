@@ -29,8 +29,8 @@ def log_1_min_a(a):
 
 # logx ,logy ->log(x+y)
 def log_add_exp(a, b):
-    maximum = torch.max(a, b)
-    return maximum + torch.log(torch.exp(a - maximum) + torch.exp(b - maximum))
+    # one kernel instead of 8 (max, 2 sub, 2 exp, add, log, add); same value up to float rounding
+    return torch.logaddexp(a, b)
 
 
 def log_sub_exp(a,b):
@@ -62,7 +62,9 @@ def index_to_log_onehot(x, num_classes):
     #     f'Error: {x.max().item()} >= {num_classes}'
     # if x.numel() == 0:
     #     x=torch.tensor([0],device="cuda:0")
-    x_onehot = F.one_hot(x, num_classes)
+    # scatter_ instead of F.one_hot: same result for valid indices, but F.one_hot checks the index range with a
+    # device -> host sync, which also breaks CUDA-graph capture of the sampling loop
+    x_onehot = torch.zeros(*x.shape, num_classes, dtype=torch.long, device=x.device).scatter_(-1, x.unsqueeze(-1), 1)
 
     permute_order = (0, -1) + tuple(range(1, len(x.size())))
 
@@ -168,6 +170,11 @@ class DiffusionBase(torch.nn.Module):
     @torch.no_grad()
     def p_sample(self, batched_graph, t_node, t_edge,embedding):
         # p_sample is always one step prediction!
+        if not getattr(self._denoise_fn, "predicts_nodes", True):
+            # The denoiser returns the clean node one-hot and never reads the noisy node state, so the node chain does
+            # not influence the edges: keep the node state as is and run only the edge chain.
+            log_model_prob_edge = self._p_pred_edges(batched_graph, t_node, t_edge, embedding)
+            return batched_graph.log_node_attr_t, self.log_sample_categorical(log_model_prob_edge, self.num_edge_classes)
         log_model_prob_node, log_model_prob_edge = self._p_pred(batched_graph, t_node, t_edge,embedding)
         
         log_out_node = self.log_sample_categorical(log_model_prob_node, self.num_node_classes)
@@ -201,7 +208,14 @@ class DiffusionBase(torch.nn.Module):
         num_nodes = batched_graph.nodes_per_graph.sum()
         num_edges = batched_graph.edges_per_graph.sum()
         batched_graph = self._prepare_data_for_sampling(batched_graph)
- 
+
+        if getattr(self, "fast_sampling", False) and str(self.device).startswith("cuda") and embedding is not None:
+            self._sample_loop_cuda_graph(batched_graph, embedding, int(num_nodes), int(num_edges))
+        else:
+            self._sample_loop(batched_graph, embedding, num_nodes, num_edges)
+        return self._finish_sampling(batched_graph)
+
+    def _sample_loop(self, batched_graph, embedding, num_nodes, num_edges):
         # print()
         for t in reversed(range(0, self.num_timesteps)):
             # print(f'Sample timestep {t:4d}', end='\r')
@@ -212,6 +226,98 @@ class DiffusionBase(torch.nn.Module):
             batched_graph.log_full_edge_attr_t = log_full_edge_attr_tmin1
             batched_graph.log_node_attr_t = log_node_attr_tmin1
 
+    @staticmethod
+    def _bucket(n, step):
+        return ((n + step - 1) // step) * step
+
+    @torch.no_grad()
+    def _sample_loop_cuda_graph(self, batched_graph, embedding, num_nodes, num_edges):
+        """The same reverse chain as _sample_loop, replayed from a captured CUDA graph.
+
+        The denoiser runs in its static, masked mode (TGNN_gin_guided._forward_static), so one step only depends on
+        the sizes (nodes, candidate edges, graphs). Sizes are rounded up to buckets and the extra rows form one
+        padding graph (its nodes and candidate edges never touch a real graph: every operation is per node, per edge
+        inside a graph, or per graph). One graph is captured per bucket and reused across calls; t is written to a
+        static buffer before every replay. Removes the per-step launch overhead (sampling is launch-bound).
+        """
+        B = int(batched_graph.num_graphs)
+        Nc = self._bucket(num_nodes + 2, 64)          # >= 2 padding nodes for the padding edges
+        Ec = self._bucket(num_edges + 1, 128)
+        Bc = self._bucket(B + 1, 32)                  # +1: the padding graph
+        emb_per_graph = embedding is not None and embedding.dim() == 2
+        key = (Nc, Ec, Bc, embedding is None, emb_per_graph)
+        cache = self.__dict__.setdefault("_cg_cache", {})
+        if key not in cache:
+            cache[key] = self._capture_bucket(Nc, Ec, Bc, batched_graph, embedding)
+        c = cache[key]
+        st = c["static"]
+        # load the real batch into the static buffers, padding = one extra graph (index B)
+        st.feature.zero_(); st.feature[:num_nodes].copy_(batched_graph.feature)
+        st.batch.fill_(B); st.batch[:num_nodes].copy_(batched_graph.batch)
+        st.full_edge_index[0].fill_(num_nodes); st.full_edge_index[1].fill_(num_nodes + 1)
+        st.full_edge_index[:, :num_edges].copy_(batched_graph.full_edge_index)
+        st.log_full_edge_attr_t.copy_(c["pad_e"]); st.log_full_edge_attr_t[:num_edges].copy_(batched_graph.log_full_edge_attr_t)
+        st.log_node_attr_t.copy_(c["pad_n"]); st.log_node_attr_t[:num_nodes].copy_(batched_graph.log_node_attr_t)
+        st.log_node_attr.copy_(c["pad_n"]); st.log_node_attr[:num_nodes].copy_(batched_graph.log_node_attr)
+        if embedding is not None:
+            e = embedding.detach().to(self.device, torch.float)
+            if emb_per_graph:
+                c["emb"].zero_(); c["emb"][:B].copy_(e)
+            else:
+                c["emb"].copy_(e)
+        for t in reversed(range(0, self.num_timesteps)):
+            c["t_node"].fill_(t); c["t_edge"].fill_(t)
+            c["graph"].replay()
+        batched_graph.log_full_edge_attr_t = st.log_full_edge_attr_t[:num_edges].clone()
+        batched_graph.log_node_attr_t = st.log_node_attr_t[:num_nodes].clone()
+
+    def _capture_bucket(self, Nc, Ec, Bc, like, embedding):
+        from types import SimpleNamespace
+        dev = self.device
+        F_ = like.feature.shape[1]
+        st = SimpleNamespace(
+            num_nodes=Nc, num_graphs=Bc,
+            feature=torch.zeros(Nc, F_, device=dev, dtype=like.feature.dtype),
+            batch=torch.zeros(Nc, device=dev, dtype=torch.long),
+            full_edge_index=torch.zeros(2, Ec, device=dev, dtype=torch.long),
+            log_full_edge_attr_t=torch.zeros(Ec, like.log_full_edge_attr_t.shape[1], device=dev),
+            log_node_attr_t=torch.zeros(Nc, like.log_node_attr_t.shape[1], device=dev),
+            log_node_attr=torch.zeros(Nc, like.log_node_attr.shape[1], device=dev))
+        pad_e = like.log_full_edge_attr_t[:1].expand(Ec, -1).clone()   # any valid one-hot state
+        pad_n = like.log_node_attr_t[:1].expand(Nc, -1).clone()
+        st.log_full_edge_attr_t.copy_(pad_e); st.log_node_attr_t.copy_(pad_n); st.log_node_attr.copy_(pad_n)
+        st.full_edge_index[1].fill_(1)
+        if embedding is None:
+            emb = None
+        elif embedding.dim() == 2:
+            emb = torch.zeros(Bc, embedding.shape[1], device=dev)
+        else:
+            emb = embedding.detach().to(dev, torch.float).clone()
+        t_node = torch.full((Nc,), self.num_timesteps - 1, device=dev, dtype=torch.long)
+        t_edge = torch.full((Ec,), self.num_timesteps - 1, device=dev, dtype=torch.long)
+        den = self._denoise_fn
+
+        def step():
+            log_n, log_e = self.p_sample(st, t_node, t_edge, emb)
+            st.log_node_attr_t.copy_(log_n)
+            st.log_full_edge_attr_t.copy_(log_e)
+
+        den.static = True
+        try:
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):  # warm-up (lazy init of cuBLAS / cuDNN handles)
+                for _ in range(2):
+                    step()
+            torch.cuda.current_stream().wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                step()
+        finally:
+            den.static = False
+        return dict(static=st, graph=graph, t_node=t_node, t_edge=t_edge, emb=emb, pad_e=pad_e, pad_n=pad_n)
+
+    def _finish_sampling(self, batched_graph):
         # print()
         edge_attr = batched_graph.log_full_edge_attr_t.argmax(-1)
         is_edge_indices = edge_attr.nonzero(as_tuple=True)[0]

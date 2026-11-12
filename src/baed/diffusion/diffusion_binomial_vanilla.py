@@ -394,6 +394,15 @@ class BinomialDiffusionVanilla(DiffusionBase):
         return log_model_pred_node, log_model_pred_edge
 
 
+    def _p_pred_edges(self, batched_graph, t_node, t_edge, embedding=None):
+        """Edge part of _p_pred only (sampling with a denoiser that does not predict nodes)."""
+        _, out_edge = self._denoise_fn(batched_graph, t_node, t_edge, embedding)
+        log_pred_edge = F.log_softmax(out_edge, dim=1)
+        if self.parametrization == 'x0':
+            return self._q_posterior(log_x_start=log_pred_edge, log_x_t=batched_graph.log_full_edge_attr_t, t=t_edge,
+                                     log_final_prob=self.log_final_prob_edge)
+        return log_pred_edge
+
     def _prepare_data_for_sampling(self, batched_graph):
         batched_graph.log_node_attr = index_to_log_onehot(batched_graph.node_attr, self.num_node_classes)
         log_prob_node = torch.ones_like(batched_graph.log_node_attr, device=self.device) * self.log_final_prob_node

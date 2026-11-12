@@ -777,6 +777,11 @@ def run(argv=None):
     parser.add_argument("--gen-ego-hops", type=int, default=2, help="hops of the ego-graph cut around A (Elliptic: 2)")
     parser.add_argument("--gen-max-tries", type=int, default=50,
                         help="isolated-center resamples of one template before it is replaced")
+    parser.add_argument("--fast-sampling", action="store_true",
+                        help="(--use-baed) sample with the static masked denoiser replayed from a captured CUDA graph "
+                             "(same distribution as the eager loop, ~2x faster)")
+    parser.add_argument("--compile-denoiser", action="store_true",
+                        help="(--fast-sampling) torch.compile the static denoiser forward before capture")
     parser.add_argument("--agg-features", default="orig", choices=["orig", "recompute"],
                         help="(--batched, Elliptic) orig = the 166 released features; recompute = keep columns 0-93 "
                              "(timestep + local) and replace the precomputed aggregates 94-165 by max/min/mean/std of "
@@ -818,6 +823,13 @@ def run(argv=None):
     if cli.use_baed and cli.aug_gen == "baed":
         gen_args = GenerateDataArgs(run_name=cli.run_name, dataset=dataset, num_samples=64, seed=cli.seed, checkpoint=cli.checkpoint)
         generator = GraphDataGenerator(gen_args)
+        # CUDA-graph sampling (static masked denoiser, one captured step replayed num_timesteps times), optionally
+        # with the static forward compiled by torch.compile. Same sampling distribution as the eager loop.
+        generator.model.fast_sampling = cli.fast_sampling
+        if cli.compile_denoiser:
+            if not cli.fast_sampling:
+                parser.error("--compile-denoiser requires --fast-sampling")
+            generator.model._denoise_fn.enable_compile()
         set_seed(cli.seed)  # the generator setup consumes RNG state
 
     if cli.model == "GCN_GAE" and AGG_MODE != "orig":

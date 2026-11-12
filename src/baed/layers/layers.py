@@ -660,6 +660,23 @@ class TGNN_embedding_guided(torch.nn.Module):
         edge_class = self.final_out(edge_emb)
         return pyg_data.log_node_attr, edge_class
 
+def _seg_sum(x, idx, n):
+    """torch_scatter.scatter(x, idx, 0, dim_size=n, reduce='sum') with native ops (torch.compile friendly)."""
+    return torch.zeros((n,) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device).index_add_(0, idx, x)
+
+
+def _seg_max(x, idx, n):
+    """torch_scatter max: empty segments give 0 (zeros + include_self=False keeps 0 where nothing is scattered)."""
+    out = torch.zeros((n,) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device)
+    return out.scatter_reduce_(0, idx.view((-1,) + (1,) * (x.dim() - 1)).expand_as(x), x, 'amax', include_self=False)
+
+
+def _seg_mean(x, idx, n):
+    """torch_scatter mean: sum / count with count clamped to >= 1 (empty segments give 0)."""
+    cnt = _seg_sum(torch.ones_like(idx, dtype=x.dtype), idx, n).clamp_(min=1)
+    return _seg_sum(x, idx, n) / cnt.view((-1,) + (1,) * (x.dim() - 1))
+
+
 class TGNN_gin_guided(torch.nn.Module):
     """Denoiser p_theta(A^{t-1} | A^t, h_g) of paper Eq. 14 / Algorithm 2, without degree prescription.
 
@@ -718,7 +735,21 @@ class TGNN_gin_guided(torch.nn.Module):
         enc.eval()
         return enc.encode(x.float(), edge_index)
 
+    predicts_nodes = False  # node logits are the clean one-hot (pyg_data.log_node_attr); the node state is never read
+    static = False  # True during CUDA-graph sampling: fixed shapes, no host sync (see _forward_static)
+    _static_impl = None  # torch.compile'd _forward_static (enable_compile)
+
+    def enable_compile(self, dynamic=False):
+        """Compile the static sampling forward with torch.compile (native segment ops, no torch_scatter)."""
+        import torch._dynamo
+        # one compiled graph per sampling size bucket; the default cache_size_limit (8) would fall back to eager
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 256)
+        self._static_impl = torch.compile(self._forward_static, dynamic=dynamic)
+
     def forward(self, pyg_data, t_node, t_edge, embedding=None):
+        if self.static:
+            impl = self._static_impl or self._forward_static
+            return impl(pyg_data, t_node, t_edge, embedding)
         n = pyg_data.num_nodes
         batch = pyg_data.batch
         b = int(batch.max()) + 1 if n else 0
@@ -751,5 +782,75 @@ class TGNN_gin_guided(torch.nn.Module):
             h = h + ctx
         z = self.node_out(torch.cat([h] + node_feats, dim=-1))
         row, col = pyg_data.full_edge_index
+        edge_class = self.final_out(torch.cat([z[row] + z[col], z[row] * z[col]], dim=-1))
+        return pyg_data.log_node_attr, edge_class
+
+    # ---- static (masked) forward: same function as forward, fixed shapes --------------------------------------
+    @staticmethod
+    def _masked_gin(conv, x, src, dst, m, n):
+        """PyG GINConv(x, A^t) with A^t given as a 0/1 mask over a fixed edge list: nn((1 + eps) x + sum_j x_j)."""
+        aggr = _seg_sum(x[src] * m[:, None], dst, n)
+        return conv.nn(aggr + (1 + conv.eps) * x)
+
+    @staticmethod
+    def _masked_transformer_conv(conv, x, src, dst, m, n):
+        """PyG TransformerConv (concat=False, root_weight, no beta / edge features) restricted to masked edges."""
+        H, C = conv.heads, conv.out_channels
+        q = conv.lin_query(x).view(-1, H, C)
+        k = conv.lin_key(x).view(-1, H, C)
+        v = conv.lin_value(x).view(-1, H, C)
+        alpha = (q[dst] * k[src]).sum(dim=-1) / math.sqrt(C)  # [E, H]
+        mm = m[:, None].expand_as(alpha)
+        amax = _seg_max(torch.where(mm, alpha, torch.full_like(alpha, float('-inf'))), dst, n)
+        amax = torch.where(torch.isfinite(amax), amax, torch.zeros_like(amax))
+        e = torch.where(mm, (alpha - amax[dst]).exp(), torch.zeros_like(alpha))
+        den = _seg_sum(e, dst, n)
+        w = e / (den[dst] + 1e-16)  # same normalisation as torch_geometric.utils.softmax
+        out = _seg_sum(v[src] * w.unsqueeze(-1), dst, n)
+        return out.mean(dim=1) + conv.lin_skip(x)
+
+    def _forward_static(self, pyg_data, t_node, t_edge, embedding=None):
+        n = pyg_data.num_nodes
+        batch = pyg_data.batch
+        b = pyg_data.num_graphs
+        row, col = pyg_data.full_edge_index
+        m_e = pyg_data.log_full_edge_attr_t.argmax(-1) != 0  # edges present in A^t
+        src, dst, m = torch.cat([row, col]), torch.cat([col, row]), torch.cat([m_e, m_e])
+        mf = m.to(torch.float)
+
+        enc = self._encoder
+        if next(enc.parameters()).device != pyg_data.feature.device:
+            enc.to(pyg_data.feature.device)
+        enc.eval()
+        ge = enc.encoder
+        x = pyg_data.feature.float()
+        z_t = self._masked_gin(ge.conv2, ge.dropout(ge.activation(self._masked_gin(ge.conv1, x, src, dst, mf, n))),
+                               src, dst, mf, n)
+        e_t = _seg_max(z_t, batch, b)
+        if embedding is not None:
+            h_g = embedding.detach().to(z_t.device, torch.float)
+            h_g = h_g.expand(b, -1) if h_g.dim() == 1 else h_g
+        else:
+            h_g = _seg_max(pyg_data.embedding.detach().float(), batch, b)
+        deg = _seg_sum(mf, src, n)
+        deg = deg.clamp(max=self.max_degree + 1)[:, None] / self.max_degree
+
+        node_feats = [self.z_in(z_t), self.deg_in(deg), self.et_in(e_t)[batch], self.hg_in(h_g)[batch]]
+        h = self.node_in(torch.cat(node_feats, dim=-1))
+        # sampling: every node of the batch is at the same step t, so the time embedding is computed on one row and
+        # broadcast (it is a row-wise function of t)
+        t = self.mlp(self.time_pos_emb(t_node[:1]))
+        state = h.unsqueeze(0)
+        ctx = self.global_mlp(_seg_mean(h, batch, b))[batch]
+        for i in range(len(self.num_heads)):
+            h = torch.cat([h, self.layers[f'time{i}'](t).expand(n, -1)], dim=-1)
+            h = self._masked_transformer_conv(self.layers[f'conv{i}'], h, src, dst, m, n)
+            h = self.dropout(self.layers[f'act{i}'](self.layers[f'norm{i}'](h)))
+            h, state = self.gru(h.unsqueeze(0).contiguous(), state.contiguous())
+            h = h.squeeze(0)
+            node_ctx = self.context_mlp(torch.cat([h, ctx], dim=-1))
+            ctx = self.global_mlp(_seg_mean(ctx + node_ctx, batch, b))[batch]
+            h = h + ctx
+        z = self.node_out(torch.cat([h] + node_feats, dim=-1))
         edge_class = self.final_out(torch.cat([z[row] + z[col], z[row] * z[col]], dim=-1))
         return pyg_data.log_node_attr, edge_class
