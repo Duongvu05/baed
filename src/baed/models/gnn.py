@@ -23,7 +23,7 @@ def graph_max_readout(graph, h):
     return torch.max(h, dim=0).values
 
 
-def graph_deviation_readout(graph, h):
+def graph_deviation_readout(graph, h, ref="all"):
     """Paper Eq. 6: h_G = H[v_i] - mean_pooling(H), one vector per ego-graph.
 
     Node 0 of every ego-graph is its center (baed.graph_ops puts it first, and generated ego-graphs keep
@@ -31,6 +31,10 @@ def graph_deviation_readout(graph, h):
     """
     n = graph.batch_num_nodes()
     start = torch.cumsum(n, 0) - n
+    if ref == "neighbors":  # center minus the mean of the OTHER nodes (Sec. 4.1: "the ego node and its neighbors")
+        tot = dgl.ops.segment_reduce(n, h, "sum")
+        nb = (tot - h[start]) / (n - 1).clamp(min=1)[:, None].to(h.dtype)
+        return torch.where((n > 1)[:, None], h[start] - nb, torch.zeros_like(nb))
     return h[start] - dgl.ops.segment_reduce(n, h, "mean")
 
 
@@ -215,7 +219,7 @@ class GCN(nn.Module):
                  activation='ReLU', readout="max", **kwargs):
         super().__init__()
         self.modelName="GCN"
-        assert readout in ("max", "deviation", "deviation_cat"), readout
+        assert readout in ("max", "deviation", "deviation_cat", "deviation_nb", "deviation_cat_nb"), readout
         self.readout = readout
         self.h_feats = h_feats
         self.layers = nn.ModuleList()
@@ -223,7 +227,7 @@ class GCN(nn.Module):
         self.layers.append(dglnn.GraphConv(in_feats, h_feats, activation=self.act))
         for i in range(num_layers-1):
             self.layers.append(dglnn.GraphConv(h_feats, h_feats, activation=self.act))
-        mlp_in = h_feats * num_layers if readout == "deviation_cat" else h_feats
+        mlp_in = h_feats * num_layers if readout.startswith("deviation_cat") else h_feats
         self.mlp = MLP(mlp_in, h_feats, num_classes, mlp_layers, dropout_rate)
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
 
@@ -237,12 +241,12 @@ class GCN(nn.Module):
                 h = self.dropout(h)
             h = layer(graph, h)
             hs.append(h)
-        if self.readout == "deviation":
-            # paper Eq. 5 (AGG = mean over the L layers), Eq. 6 (center minus mean of the ego-graph),
-            # Eq. 8 (MLP on the per-graph vector)
-            return self.mlp(graph_deviation_readout(graph, torch.stack(hs).mean(0)), False)
-        if self.readout == "deviation_cat":  # same, with AGG = concatenation of the layers
-            return self.mlp(graph_deviation_readout(graph, torch.cat(hs, -1)), False)
+        if self.readout.startswith("deviation"):
+            # paper Eq. 5 (AGG = mean over the L layers, or concatenation for *_cat), Eq. 6 (center minus the
+            # mean of all ego-graph nodes, or of the neighbours only for *_nb), Eq. 8 (MLP on the graph vector)
+            H = torch.cat(hs, -1) if "_cat" in self.readout else torch.stack(hs).mean(0)
+            ref = "neighbors" if self.readout.endswith("_nb") else "all"
+            return self.mlp(graph_deviation_readout(graph, H, ref), False)
         h = self.mlp(h, False)
         # print("h:",h)
         h = graph_max_readout(graph, h)
