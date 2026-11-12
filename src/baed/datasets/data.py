@@ -39,6 +39,19 @@ class NetworkDataset(Dataset):
         return self.num_iter
 
 
+def _training_view(d):
+    """The graph without its per-column feature copies ``feature0 .. featureK``.
+
+    ``preprocess`` stores every feature column a second time as its own attribute (read only by the
+    empty-graph sampler, from the full graphs). In a training batch each of them was collated and copied
+    to the GPU separately, ~170 host-to-device copies with a sync per step, for attributes the loss never
+    reads. ``feature`` (all columns), the edges, the embedding and the labels are kept, unchanged.
+    """
+    keep = {k: v for k, v in d.to_dict().items() if not (k.startswith("feature") and k[7:].isdigit())}
+    keep["num_nodes"] = d.num_nodes
+    return pyg.data.Data(**keep)
+
+
 class GraphDataset(Dataset):
     def __init__(self, pyg_datas):
         super().__init__()
@@ -410,6 +423,8 @@ def get_data(args):
 
     # Data Loader
     # train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=args.pin_memory, collate_fn=collate_fn)
+    if isinstance(train_set, GraphDataset):  # training batches without the per-column copies (_training_view)
+        train_set = GraphDataset([_training_view(d) for d in train_set.pyg_datas])
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=False, collate_fn=collate_fn)
     eval_loader = DataLoader(eval_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=False, collate_fn=collate_fn)

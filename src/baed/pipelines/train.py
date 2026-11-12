@@ -4,8 +4,10 @@ from baed.diffusion.utils import set_seeds
 # import torch.multiprocessing as mp
 # mp.set_start_method('spawn')
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] ="1"
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
+# CUDA_LAUNCH_BLOCKING=1 was forced here (a debugging setting): every kernel launch then waits for the GPU,
+# about 40x slower launches and ~3x slower training. Same kernels in the same order without it; set it in the
+# shell environment when debugging a CUDA error.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:512')
 
 
 # Data
