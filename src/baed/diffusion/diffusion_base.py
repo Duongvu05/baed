@@ -193,8 +193,9 @@ class DiffusionBase(torch.nn.Module):
             return self._eval_loss(batched_graph)
 
 
-    def sample(self, num_samples,embedding):
-        batched_graph = self.initial_graph_sampler.sample(num_samples)
+    def sample(self, num_samples,embedding, init_graph=None):
+        # init_graph: an empty batch built from given templates (sizes + node features); None = draw at random
+        batched_graph = self.initial_graph_sampler.sample(num_samples) if init_graph is None else init_graph
         batched_graph.to(self.device)
 
         num_nodes = batched_graph.nodes_per_graph.sum()

@@ -75,6 +75,57 @@ class GraphDataGenerator:
     def generate_arrays(self, num_samples, feature_num, embedding=None):
         """Same samples as ``generate_data`` but returned as tensors (see ``postprocess_batch``)."""
         return postprocess_batch(self.model.sample(num_samples, embedding), feature_num)
+
+    def draw_templates(self, n, min_nodes=2):
+        """n template ego-graphs (node features of a real train fraud ego-graph) with >= min_nodes nodes, drawn
+        uniformly from the empirical pool (so sizes follow the empirical distribution restricted to >= min_nodes)."""
+        if not hasattr(self, "_pool"):
+            self._pool = {}
+        if min_nodes not in self._pool:
+            d = self.initial_graph_sampler.empirical_node_feat_dist
+            self._pool[min_nodes] = [(k, ft) for k, v in d.items() if k >= min_nodes for ft in v]
+        return random.choices(self._pool[min_nodes], k=n)
+
+    def generate_center_egos(self, templates, feature_num, embedding, hops):
+        """Sample edges for the given templates. Node 0 of every template is its center A.
+
+        Returns one entry per template: (features, edge_index) of the hops-ego-graph around A in the generated
+        graph, A renumbered to 0, edges in both directions; or None when A has no neighbour other than itself
+        (edges between other nodes, or a self-loop on A, do not count).
+        """
+        init = self.initial_graph_sampler._generate_empty_data([k for k, _ in templates], [ft for _, ft in templates])
+        emb = embedding
+        if emb is not None and emb.dim() == 1:
+            emb = emb.reshape(1, -1).expand(len(templates), -1)
+        batch = self.model.sample(len(templates), emb, init_graph=init)
+        ptr = batch.ptr.cpu().numpy()
+        ei = batch.edge_index.cpu().numpy() if batch.edge_index.numel() else np.zeros((2, 0), np.int64)
+        x = torch.stack([batch[f"feature{i}"].reshape(batch.num_nodes) for i in range(feature_num)], dim=1).cpu()
+        gid = np.searchsorted(ptr, ei[0], side="right") - 1
+        out = []
+        for g in range(len(templates)):
+            s, t = ptr[g], ptr[g + 1]
+            m = gid == g
+            u, v = ei[0, m] - s, ei[1, m] - s
+            keep = u != v
+            u, v = u[keep], v[keep]
+            adj = [set() for _ in range(t - s)]
+            for a, b in zip(u.tolist(), v.tolist()):
+                adj[a].add(b); adj[b].add(a)
+            if not adj[0]:
+                out.append(None)
+                continue
+            seen, frontier = {0}, {0}
+            for _ in range(hops):
+                frontier = {w for q in frontier for w in adj[q]} - seen
+                if not frontier:
+                    break
+                seen |= frontier
+            nodes = [0] + sorted(seen - {0})
+            pos = {q: i for i, q in enumerate(nodes)}
+            e = [(pos[a], pos[b]) for a in nodes for b in adj[a] if b in pos]
+            out.append((x[torch.tensor(nodes) + int(s)], torch.tensor(e, dtype=torch.long).t().contiguous()))
+        return out
     
 
 def postprocess_batch(batch, feature_num):
