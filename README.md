@@ -57,6 +57,48 @@ uv run baed-detect --dataset elliptic --model GraphSAGE --gae-weight elliptic_ga
 
 Every step has `--help`. Defaults reproduce the values hard-coded in the original scripts.
 
+## Unified +BAED setting (Elliptic)
+
+`MODEL=GCN SEEDS="15" bash scripts/run_baed_unified.sh` runs base and +BAED with the setting below.
+Results go to `outputs/results/elliptic/unified/`.
+
+| Part | Choice | Flag |
+|---|---|---|
+| Split | ego-graphs in time order, sequential 70 / 15 / 15 (as released) | `--split sequential` |
+| Ego-graphs | out-edges, labelled nodes only, single-node ego-graphs dropped | default |
+| Node features | timestep and the 93 local features, 1-hop aggregates recomputed on each ego-graph | `--agg-features recompute` |
+| Generator | GIN-guided ego-graph diffusion, run `elliptic_fulltrain_gin_et_b32` | `--run-name`, `--checkpoint 300` |
+| Synthetic node features | copied from the template ego-graph, no Gaussian noise | `--gen-noise 0` |
+| Guidance weights | paper Eq. 17 and 18 | `--curriculum sigmoid` |
+| Sampling | synthetic graphs of 16 batches in one diffusion call | `--gen-chunk 16` |
+
+Why these choices differ from the paper text.
+
+- **No Gaussian noise.** The paper adds N(0, 1) to the copied features. Real train fraud nodes lie
+  about 0.09 apart (median nearest-neighbour distance), and the noise moves a synthetic node about 13
+  away from every real node. 154 of the 166 feature dimensions have a fraud std below 1. The detector
+  then learns to flag noisy points rather than fraud. Removing the noise raised val macro F1 of
+  GCN +BAED from 0.666 to 0.727 (seed 15).
+- **Recomputed aggregates.** Columns 94 to 165 of Elliptic are anonymised 1-hop statistics computed on
+  the full graph. For a generated ego-graph they describe the neighbours of the copied template, not the
+  generated edges. `--agg-features recompute` drops them and adds max, min, mean and std of the 93 local
+  features over the ego-graph's own 1-hop neighbours (undirected), plus log(1 + degree). The same
+  function runs on real and generated ego-graphs, so message passing and the aggregate features use
+  the same edge set. Node features become 467-dimensional. The guidance encoder and the diffusion
+  still see the 166 released features.
+- **`--gen-chunk`.** Sampling is launch-bound (92 graphs take as long as 400). With K = 16 one epoch takes
+  about 12 s instead of 95 s on an RTX 3060. K = 1 reproduces the per-batch loop exactly (same epoch
+  losses and test metrics over 2 epochs). With K > 1 the guidance of the K batches uses the detector as it
+  is at the start of the chunk.
+
+GCN, seed 15, test set of 4350 ego-graphs with 116 frauds. F1 is the fraud class F1.
+
+| GCN | AUROC | AUPRC | F1 | Macro F1 | Val AUROC | Val Macro F1 |
+|---|---|---|---|---|---|---|
+| Base | 0.689 | 0.058 | 0.060 | 0.521 | 0.919 | 0.758 |
+| +BAED, N(0, 1) noise | 0.653 | 0.040 | 0.009 | 0.492 | 0.897 | 0.666 |
+| +BAED, no noise | 0.700 | 0.051 | 0.012 | 0.497 | 0.908 | 0.727 |
+
 ## What changed vs. upstream
 
 | Area | Upstream | Here |
