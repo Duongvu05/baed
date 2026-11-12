@@ -542,6 +542,27 @@ def test_batched(detector, test_loader, model_path):
 
 
 GEN_CHUNK = 1  # set by --gen-chunk
+GEN_FILL = False  # set by --gen-fill
+STATS = {}  # per-epoch class counts of the graphs fed to the loss (reset in train_batched)
+
+
+def _valid(gf, ge):
+    """Synthetic graphs that _batch keeps (it drops edgeless ego-graphs unless KEEP_ISOLATED)."""
+    keep_i = [i for i, e in enumerate(ge) if KEEP_ISOLATED or e.numel() > 0]
+    return [gf[i] for i in keep_i], [ge[i] for i in keep_i]
+
+
+def _sample_jobs(generator, jobs, nf, withcondition):
+    """Sample n graphs per (n, guidance) job, all jobs in one diffusion call when possible."""
+    if len(jobs) == 1 or not withcondition or any(e is None for _, e in jobs):
+        return [tuple(map(list, generator.generate_arrays(n, nf, embedding=e))) for n, e in jobs]
+    emb = torch.cat([e.reshape(1, -1).expand(n, -1) for n, e in jobs])
+    gf, ge = generator.generate_arrays(len(emb), nf, embedding=emb)
+    out, o = [], 0
+    for n, _ in jobs:
+        out.append((list(gf[o:o + n]), list(ge[o:o + n])))
+        o += n
+    return out
 
 
 def _augmented_batches(train_loader, detector, generator, gae, epoch, use_baed, withcondition):
@@ -568,6 +589,9 @@ def _augmented_batches(train_loader, detector, generator, gae, epoch, use_baed, 
                 break
         if not chunk:
             return
+        for _, _, labels in chunk:
+            STATS["real_normal"] += int((labels == 0).sum())
+            STATS["real_fraud"] += int((labels == 1).sum())
         jobs = []  # (index in chunk, number to generate, guidance vector or None)
         if use_baed:
             for k, (feats, edges, labels) in enumerate(chunk):
@@ -578,21 +602,32 @@ def _augmented_batches(train_loader, detector, generator, gae, epoch, use_baed, 
                     jobs.append((k, n_norm - n_anom, emb))
         if jobs:
             nf = chunk[0][0][0].size(1)
-            if len(jobs) == 1 or not withcondition or any(e is None for _, _, e in jobs):
-                gen = [generator.generate_arrays(n, nf, embedding=e) for _, n, e in jobs]
-            else:
-                emb = torch.cat([e.reshape(1, -1).expand(n, -1) for _, n, e in jobs])
-                gf, ge = generator.generate_arrays(len(emb), nf, embedding=emb)
-                gen, o = [], 0
-                for _, n, _ in jobs:
-                    gen.append((gf[o:o + n], ge[o:o + n]))
-                    o += n
+            gen = _sample_jobs(generator, [(n, e) for _, n, e in jobs], nf, withcondition)
+            if GEN_FILL:  # keep only graphs that _batch keeps, top up until every batch has its quota
+                need = [n for _, n, _ in jobs]
+                gen = [_valid(gf, ge) for gf, ge in gen]
+                rate = max(sum(len(g[0]) for g in gen) / max(sum(need), 1), 0.05)
+                for _ in range(50):
+                    short = [max(n - len(g[0]), 0) for n, g in zip(need, gen)]
+                    if not any(short):
+                        break
+                    req = [int(np.ceil(m / rate * 1.1)) if m else 0 for m in short]
+                    more = _sample_jobs(generator, [(r, e) for r, (_, _, e) in zip(req, jobs) if r], nf, withcondition)
+                    got = 0
+                    for i in [i for i, r in enumerate(req) if r]:
+                        gf, ge = _valid(*more.pop(0))
+                        got += len(gf)
+                        gen[i] = (gen[i][0] + gf, gen[i][1] + ge)
+                    rate = max(got / max(sum(req), 1), 0.05)
+                gen = [(g[0][:n], g[1][:n]) for n, g in zip(need, gen)]
             for (k, _, _), (gfeat, gedge) in zip(jobs, gen):
                 feats, edges, labels = chunk[k]
                 if AUG["gen_noise"] > 0:  # paper: synthetic features = original values + N(0, 1)
                     gfeat = [f.float() + AUG["gen_noise"] * torch.randn(f.shape) for f in gfeat]
                 chunk[k] = (feats + list(gfeat), edges + list(gedge),
                             torch.cat((labels, torch.ones(len(gfeat), dtype=torch.long))))
+                STATS["syn_requested"] += next(n for kk, n, _ in jobs if kk == k)
+                STATS["syn_valid"] += sum(1 for e in gedge if e.numel() > 0)
         yield from chunk
 
 
@@ -605,6 +640,7 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
         AUG["progress"] = (epoch + 1) / num_epochs
         detector.train()
         tot, cnt = 0.0, 0
+        STATS.update(real_normal=0, real_fraud=0, syn_requested=0, syn_valid=0)
         for feats, edges, labels in _augmented_batches(train_loader, detector, generator, gae, epoch, use_baed,
                                                        withcondition):
             bg, y, pos = _batch(feats, edges, labels)
@@ -623,6 +659,11 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
             best = avg
             torch.save(detector.state_dict(), model_path)
         print(f"Epoch {epoch + 1}: Average Error = {avg}")
+        if use_baed:
+            fr = STATS["real_fraud"] + STATS["syn_valid"]
+            print(f"  loss batches: normal {STATS['real_normal']} | fraud {fr} (real {STATS['real_fraud']}, "
+                  f"synthetic {STATS['syn_valid']} of {STATS['syn_requested']} requested) | fraud share "
+                  f"{fr / max(fr + STATS['real_normal'], 1):.3f}")
     m = test_batched(detector, test_loader, model_path)
     if eval_loader is not None:
         v = test_batched(detector, eval_loader, model_path)
@@ -704,6 +745,9 @@ def run(argv=None):
     parser.add_argument("--gen-chunk", type=int, default=1,
                         help="(--batched, --use-baed) sample the synthetic anomalies of K consecutive batches in one "
                              "diffusion call (4-5x faster); their guidance uses the detector at the start of the chunk")
+    parser.add_argument("--gen-fill", action="store_true",
+                        help="(--batched, --use-baed) drop synthetic ego-graphs that the loss would skip (no edge) "
+                             "and sample more until each batch gets n_normal - n_fraud valid ones (50%% fraud)")
     parser.add_argument("--agg-features", default="orig", choices=["orig", "recompute"],
                         help="(--batched, Elliptic) orig = the 166 released features; recompute = keep columns 0-93 "
                              "(timestep + local) and replace the precomputed aggregates 94-165 by max/min/mean/std of "
@@ -712,8 +756,9 @@ def run(argv=None):
     parser.add_argument("--data-tag", default="", help="ego-graph file suffix, e.g. _full -> <dataset>_full_init_0_1_dataset.pkl")
     parser.add_argument("--out", default=None, help="write metrics as JSON here")
     cli = parser.parse_args(argv)
-    global KEEP_ISOLATED, AGG_MODE, GEN_CHUNK
+    global KEEP_ISOLATED, AGG_MODE, GEN_CHUNK, GEN_FILL
     GEN_CHUNK = max(1, cli.gen_chunk)
+    GEN_FILL = cli.gen_fill
     KEEP_ISOLATED = cli.keep_isolated
     AGG_MODE = cli.agg_features
     if AGG_MODE == "recompute":
@@ -748,7 +793,7 @@ def run(argv=None):
 
     detector = build_detector(cli.model, cli.node_feats).to(device)
     optimizer = optim.Adam(detector.parameters(), lr=cli.lr)
-    tag = f"{cli.model}_{(cli.aug_gen.upper() if cli.use_baed else 'None')}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "") + ("_aggrc" if AGG_MODE == "recompute" else "") + (f"_gc{GEN_CHUNK}" if GEN_CHUNK > 1 else "")
+    tag = f"{cli.model}_{(cli.aug_gen.upper() if cli.use_baed else 'None')}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "") + ("_aggrc" if AGG_MODE == "recompute" else "") + (f"_gc{GEN_CHUNK}" if GEN_CHUNK > 1 else "") + ("_fill" if GEN_FILL else "")
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
