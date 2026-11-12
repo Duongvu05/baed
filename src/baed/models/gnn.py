@@ -23,6 +23,17 @@ def graph_max_readout(graph, h):
     return torch.max(h, dim=0).values
 
 
+def graph_deviation_readout(graph, h):
+    """Paper Eq. 6: h_G = H[v_i] - mean_pooling(H), one vector per ego-graph.
+
+    Node 0 of every ego-graph is its center (baed.graph_ops puts it first, and generated ego-graphs keep
+    the template's center at index 0 after the largest-component step). A single-node graph gives 0.
+    """
+    n = graph.batch_num_nodes()
+    start = torch.cumsum(n, 0) - n
+    return h[start] - dgl.ops.segment_reduce(n, h, "mean")
+
+
 class PolyConv(nn.Module):
     def __init__(self, theta):
         super(PolyConv, self).__init__()
@@ -201,9 +212,11 @@ class BWGNN(nn.Module):
 
 class GCN(nn.Module):
     def __init__(self, in_feats, h_feats=32, num_classes=2, num_layers=2, mlp_layers=1, dropout_rate=0,
-                 activation='ReLU', **kwargs):
+                 activation='ReLU', readout="max", **kwargs):
         super().__init__()
         self.modelName="GCN"
+        assert readout in ("max", "deviation"), readout
+        self.readout = readout
         self.h_feats = h_feats
         self.layers = nn.ModuleList()
         self.act = getattr(nn, activation)()
@@ -217,10 +230,16 @@ class GCN(nn.Module):
         h = graph.ndata['feature'].to(dtype=torch.float)  # 转换为 float32
         # h = graph.ndata['feature']
         # print("h:",h)
+        hs = []
         for i, layer in enumerate(self.layers):
             if i != 0:
                 h = self.dropout(h)
             h = layer(graph, h)
+            hs.append(h)
+        if self.readout == "deviation":
+            # paper Eq. 5 (AGG = mean over the L layers), Eq. 6 (center minus mean of the ego-graph),
+            # Eq. 8 (MLP on the per-graph vector)
+            return self.mlp(graph_deviation_readout(graph, torch.stack(hs).mean(0)), False)
         h = self.mlp(h, False)
         # print("h:",h)
         h = graph_max_readout(graph, h)

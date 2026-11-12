@@ -144,6 +144,9 @@ def build_ego_graphs(
     graphs = []
     for j, c in enumerate(kept_centers):
         nd = nodes[node_ptr[j] : node_ptr[j + 1]]
+        # the BFS returns the nodes sorted by id, so the ego (center) node can sit anywhere. Put it first:
+        # node 0 of every ego-graph is its center (needed by the deviation readout of paper Eq. 6).
+        nd = np.concatenate([[c], nd[nd != c]]).astype(nd.dtype)
         ed = edges[edge_ptr[j] : edge_ptr[j + 1]]
         idx = torch.from_numpy(nd)
         feat = features[idx]
