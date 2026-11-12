@@ -675,7 +675,7 @@ def run(argv=None):
     global device, sample_losses
     parser = argparse.ArgumentParser(description=main.__doc__)
     parser.add_argument("--dataset", default="reddit")
-    parser.add_argument("--model", default="GraphSAGE", choices=["BWGNN", "BernNet", "GCN", "GIN", "GraphSAGE"])
+    parser.add_argument("--model", default="GraphSAGE", choices=["BWGNN", "BernNet", "GCN", "GCN_GAE", "GIN", "GraphSAGE"])
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=0.0001)
     parser.add_argument("--node-feats", type=int, default=64)
