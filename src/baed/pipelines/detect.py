@@ -541,6 +541,61 @@ def test_batched(detector, test_loader, model_path):
     return m
 
 
+GEN_CHUNK = 1  # set by --gen-chunk
+
+
+def _augmented_batches(train_loader, detector, generator, gae, epoch, use_baed, withcondition):
+    """Yield (feats, edges, labels) of each training batch, balanced with synthetic anomalies.
+
+    paper Eq. 17: l_i is the detection loss of the i-th anomaly of THIS batch. The released code looked
+    losses up by (batch number, position) from the previous epoch, but the train loader is shuffled, so
+    those losses belonged to other samples. Here l_i is the loss of the current detector on the batch's
+    own real ego-graphs. Epoch 0 keeps the average weights (Algorithm 3, line 10).
+
+    Sampling is launch-bound (128 denoising steps on tiny graphs: 92 graphs take as long as 400), so
+    with GEN_CHUNK = K > 1 the synthetic graphs of K consecutive batches are sampled in ONE call, each
+    graph with the guidance vector of its own batch. The guidance (and the curriculum losses) of the K
+    batches are then computed with the detector as it is at the start of the chunk. K = 1 is the
+    per-batch behaviour.
+    """
+    it = iter(tqdm(train_loader, leave=False))
+    while True:
+        chunk = []
+        for data in it:
+            if data:
+                chunk.append((list(data.subFeature), list(data.sub_edge_index), data.sub_label))
+            if len(chunk) == GEN_CHUNK:
+                break
+        if not chunk:
+            return
+        jobs = []  # (index in chunk, number to generate, guidance vector or None)
+        if use_baed:
+            for k, (feats, edges, labels) in enumerate(chunk):
+                n_norm, n_anom = int((labels == 0).sum()), int((labels == 1).sum())
+                if n_anom < n_norm:
+                    emb = _guidance(gae, feats, edges, labels, _current_losses(detector, feats, edges, labels)
+                                    if epoch else None) if withcondition else None
+                    jobs.append((k, n_norm - n_anom, emb))
+        if jobs:
+            nf = chunk[0][0][0].size(1)
+            if len(jobs) == 1 or not withcondition or any(e is None for _, _, e in jobs):
+                gen = [generator.generate_arrays(n, nf, embedding=e) for _, n, e in jobs]
+            else:
+                emb = torch.cat([e.reshape(1, -1).expand(n, -1) for _, n, e in jobs])
+                gf, ge = generator.generate_arrays(len(emb), nf, embedding=emb)
+                gen, o = [], 0
+                for _, n, _ in jobs:
+                    gen.append((gf[o:o + n], ge[o:o + n]))
+                    o += n
+            for (k, _, _), (gfeat, gedge) in zip(jobs, gen):
+                feats, edges, labels = chunk[k]
+                if AUG["gen_noise"] > 0:  # paper: synthetic features = original values + N(0, 1)
+                    gfeat = [f.float() + AUG["gen_noise"] * torch.randn(f.shape) for f in gfeat]
+                chunk[k] = (feats + list(gfeat), edges + list(gedge),
+                            torch.cat((labels, torch.ones(len(gfeat), dtype=torch.long))))
+        yield from chunk
+
+
 def train_batched(detector, generator, gae, train_loader, test_loader, num_epochs, optimizer, dataset,
                   use_baed, withcondition, run_tag, eval_loader=None):
     model_path = str(paths.ensure(paths.root() / "outputs" / "detect_weights" /
@@ -550,26 +605,8 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
         AUG["progress"] = (epoch + 1) / num_epochs
         detector.train()
         tot, cnt = 0.0, 0
-        for b, data in enumerate(tqdm(train_loader, leave=False)):
-            if not data:
-                continue
-            feats, edges, labels = list(data.subFeature), list(data.sub_edge_index), data.sub_label
-            n_norm, n_anom = int((labels == 0).sum()), int((labels == 1).sum())
-            if use_baed and n_anom < n_norm:
-                # paper Eq. 17: l_i is the detection loss of the i-th anomaly of THIS batch. The released
-                # code looked losses up by (batch number, position) from the previous epoch, but the train
-                # loader is shuffled, so those losses belonged to other samples. Here l_i is the loss of the
-                # current detector (before this step's update) on the batch's own real ego-graphs.
-                # Epoch 0 keeps the average weights (Algorithm 3, line 10).
-                emb = _guidance(gae, feats, edges, labels, _current_losses(detector, feats, edges, labels)
-                                if epoch else None) if withcondition else None
-                diff = n_norm - n_anom
-                gfeat, gedge = generator.generate_arrays(diff, feats[0].size(1), embedding=emb)
-                if AUG["gen_noise"] > 0:  # paper: synthetic features = original values + N(0, 1)
-                    gfeat = [f.float() + AUG["gen_noise"] * torch.randn(f.shape) for f in gfeat]
-                feats += gfeat
-                edges += gedge
-                labels = torch.cat((labels, torch.ones(len(gfeat), dtype=torch.long)))
+        for feats, edges, labels in _augmented_batches(train_loader, detector, generator, gae, epoch, use_baed,
+                                                       withcondition):
             bg, y, pos = _batch(feats, edges, labels)
             if bg is None:
                 continue
@@ -664,6 +701,9 @@ def run(argv=None):
     parser.add_argument("--aug-gen", default="baed", choices=["baed", "ggad", "aegis"],
                         help="(--batched, with --use-baed) generator of synthetic anomalies: BAED diffusion, or the "
                              "GGAD / AEGIS baselines adapted to ego-graphs (see baed.aug_generators)")
+    parser.add_argument("--gen-chunk", type=int, default=1,
+                        help="(--batched, --use-baed) sample the synthetic anomalies of K consecutive batches in one "
+                             "diffusion call (4-5x faster); their guidance uses the detector at the start of the chunk")
     parser.add_argument("--agg-features", default="orig", choices=["orig", "recompute"],
                         help="(--batched, Elliptic) orig = the 166 released features; recompute = keep columns 0-93 "
                              "(timestep + local) and replace the precomputed aggregates 94-165 by max/min/mean/std of "
@@ -672,7 +712,8 @@ def run(argv=None):
     parser.add_argument("--data-tag", default="", help="ego-graph file suffix, e.g. _full -> <dataset>_full_init_0_1_dataset.pkl")
     parser.add_argument("--out", default=None, help="write metrics as JSON here")
     cli = parser.parse_args(argv)
-    global KEEP_ISOLATED, AGG_MODE
+    global KEEP_ISOLATED, AGG_MODE, GEN_CHUNK
+    GEN_CHUNK = max(1, cli.gen_chunk)
     KEEP_ISOLATED = cli.keep_isolated
     AGG_MODE = cli.agg_features
     if AGG_MODE == "recompute":
@@ -707,7 +748,7 @@ def run(argv=None):
 
     detector = build_detector(cli.model, cli.node_feats).to(device)
     optimizer = optim.Adam(detector.parameters(), lr=cli.lr)
-    tag = f"{cli.model}_{(cli.aug_gen.upper() if cli.use_baed else 'None')}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "") + ("_aggrc" if AGG_MODE == "recompute" else "")
+    tag = f"{cli.model}_{(cli.aug_gen.upper() if cli.use_baed else 'None')}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "") + ("_aggrc" if AGG_MODE == "recompute" else "") + (f"_gc{GEN_CHUNK}" if GEN_CHUNK > 1 else "")
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
