@@ -27,7 +27,7 @@ from torch.nn import functional as F
 import torch.optim as optim
 
 # 引入子图异常检测模型
-from baed.models.gnn import BWGNN, BernNet, GCN, GIN, GraphSAGE
+from baed.models.gnn import BWGNN, BernNet, GCN, GCN_GAE, GIN, GraphSAGE
 from tqdm import tqdm
 # 引入数据预处理
 from baed.datasets.graphDataset import GraphDataset
@@ -630,19 +630,20 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
     return m
 
 
-def build_detector(name, nodes_feats, readout="max"):
-    if readout != "max" and name != "GCN":
-        raise ValueError("--readout deviation is implemented for GCN only")
+def build_detector(name, nodes_feats, readout="max", self_loop=False, gnn_init=None, freeze_gnn=False):
+    kw = dict(in_feats=nodes_feats, readout=readout)
     if name == "BWGNN":
-        return BWGNN(in_feats=nodes_feats, activation='Sigmoid')
+        return BWGNN(activation='Sigmoid', **kw)
     if name == "BernNet":
-        return BernNet(in_feats=nodes_feats, activation='Sigmoid')
+        return BernNet(activation='Sigmoid', **kw)
     if name == "GCN":
-        return GCN(in_feats=nodes_feats, readout=readout)
+        return GCN(self_loop=self_loop, **kw)
+    if name == "GCN_GAE":
+        return GCN_GAE(gae_path=gnn_init, freeze=freeze_gnn, **kw)
     if name == "GIN":
         return GIN(in_feats=nodes_feats)
     if name == "GraphSAGE":
-        return GraphSAGE(in_feats=nodes_feats)
+        return GraphSAGE(**kw)
     raise ValueError(name)
 
 
@@ -710,7 +711,11 @@ def run(argv=None):
                         help="max = released code (MLP per node, max over the ego-graph); deviation = paper Eq. 5-8 "
                              "(mean over layers, center embedding minus the ego-graph mean, then MLP); deviation_cat = "
                              "the same with the layers concatenated (Eq. 5 allows mean or concatenation); *_nb subtracts the mean "
-                             "of the neighbours instead of all nodes. GCN only")
+                             "of the neighbours instead of all nodes. Every detector uses a 2-layer MLP after a deviation readout")
+    parser.add_argument("--gcn-self-loop", action="store_true", help="GCN: convolve on A + I (Kipf & Welling)")
+    parser.add_argument("--gnn-init", default="elliptic_gae_relu_256_whole.pt",
+                        help="GCN_GAE: GAE checkpoint (weights/gae/) whose GCN encoder was trained on the whole graph")
+    parser.add_argument("--freeze-gnn", action="store_true", help="GCN_GAE: keep the pre-trained encoder fixed")
     parser.add_argument("--agg-features", default="orig", choices=["orig", "recompute"],
                         help="(--batched, Elliptic) orig = the 166 released features; recompute = keep columns 0-93 "
                              "(timestep + local) and replace the precomputed aggregates 94-165 by max/min/mean/std of "
@@ -753,9 +758,12 @@ def run(argv=None):
         generator = GraphDataGenerator(gen_args)
         set_seed(cli.seed)  # the generator setup consumes RNG state
 
-    detector = build_detector(cli.model, cli.node_feats, cli.readout).to(device)
+    if cli.model == "GCN_GAE" and AGG_MODE != "orig":
+        parser.error("GCN_GAE: the GAE checkpoint expects the 166 released features (--agg-features orig)")
+    detector = build_detector(cli.model, cli.node_feats, cli.readout, cli.gcn_self_loop,
+                              str(paths.gae_weight(cli.gnn_init)), cli.freeze_gnn).to(device)
     optimizer = optim.Adam(detector.parameters(), lr=cli.lr)
-    tag = f"{cli.model}_{(cli.aug_gen.upper() if cli.use_baed else 'None')}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "") + ("_aggrc" if AGG_MODE == "recompute" else "") + (f"_gc{GEN_CHUNK}" if GEN_CHUNK > 1 else "") + {"max": "", "deviation": "_dev", "deviation_cat": "_devcat", "deviation_nb": "_devnb",
+    tag = f"{cli.model}_{(cli.aug_gen.upper() if cli.use_baed else 'None')}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "") + ("_aggrc" if AGG_MODE == "recompute" else "") + (f"_gc{GEN_CHUNK}" if GEN_CHUNK > 1 else "") + ("_sl" if cli.gcn_self_loop else "") + ("_frz" if cli.freeze_gnn else "") + {"max": "", "deviation": "_dev", "deviation_cat": "_devcat", "deviation_nb": "_devnb",
                                                                    "deviation_cat_nb": "_devcatnb"}[cli.readout]
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))

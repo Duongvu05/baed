@@ -38,6 +38,30 @@ def graph_deviation_readout(graph, h, ref="all"):
     return h[start] - dgl.ops.segment_reduce(n, h, "mean")
 
 
+def parse_readout(readout):
+    """'max' (released code) or 'deviation[_cat][_nb]' (paper Eq. 5-8). Returns (is_dev, concat, ref)."""
+    assert readout in ("max", "deviation", "deviation_cat", "deviation_nb", "deviation_cat_nb"), readout
+    return readout != "max", "_cat" in readout, ("neighbors" if readout.endswith("_nb") else "all")
+
+
+class DeviationHead(nn.Module):
+    """Paper Eq. 5-8, shared by every detector (plug-and-play): H = AGG(layer outputs) (mean, or concatenation
+    with *_cat), h = H[center] - mean_pooling (all nodes, or the neighbours with *_nb), p = MLP(h) with a
+    2-layer MLP."""
+
+    def __init__(self, layer_dims, readout, h_feats=32, num_classes=2):
+        super().__init__()
+        _, self.concat, self.ref = parse_readout(readout)
+        if not self.concat and len(set(layer_dims)) > 1:
+            raise ValueError(f"AGG = mean needs equal layer widths, got {layer_dims}; use a *_cat readout")
+        in_dim = sum(layer_dims) if self.concat else layer_dims[0]
+        self.mlp = MLP(in_dim, h_feats, num_classes, num_layers=2)
+
+    def forward(self, graph, hs):
+        H = torch.cat(hs, -1) if self.concat else torch.stack(hs).mean(0)
+        return self.mlp(graph_deviation_readout(graph, H, self.ref), False)
+
+
 class PolyConv(nn.Module):
     def __init__(self, theta):
         super(PolyConv, self).__init__()
@@ -100,7 +124,7 @@ class BernConv(nn.Module):
 
 class BernNet(nn.Module):
     def __init__(self, in_feats, h_feats=32, num_classes=2, orders=2, mlp_layers=1, dropout_rate=0, activation='ReLU',
-                 **kwargs):
+                 readout="max", **kwargs):
         super().__init__()
         self.modelName="BernNet"
         self.bernconv = BernConv(orders=orders)
@@ -108,6 +132,7 @@ class BernNet(nn.Module):
         self.linear2 = nn.Linear(h_feats, h_feats)
         self.mlp = MLP(h_feats, h_feats, num_classes, mlp_layers, dropout_rate=dropout_rate)
         self.act = getattr(nn, activation)()
+        self.dev = DeviationHead([h_feats], readout, h_feats) if parse_readout(readout)[0] else None
 
     def forward(self, graph):
         # in_feat = graph.ndata['feature']
@@ -118,6 +143,8 @@ class BernNet(nn.Module):
         h = self.act(h)
         h = self.bernconv(graph, h)
         h = self.act(h)
+        if self.dev is not None:
+            return self.dev(graph, [h])
         h = self.mlp(h, False)
         h = graph_max_readout(graph, h)
         return h
@@ -183,7 +210,7 @@ def calculate_theta(d):
 
 class BWGNN(nn.Module):
     def __init__(self, in_feats, h_feats=32, num_classes=2, num_layers=2, mlp_layers=2, dropout_rate=0,
-                 activation='ReLU', **kwargs):
+                 activation='ReLU', readout="max", **kwargs):
         super(BWGNN, self).__init__()
         self.modelName="BWGNN"
         self.thetas = calculate_theta(d=num_layers)
@@ -195,6 +222,8 @@ class BWGNN(nn.Module):
         self.mlp = MLP(h_feats*len(self.conv), h_feats, num_classes, mlp_layers, dropout_rate)
         self.act = getattr(nn, activation)()
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+        # the band-pass filters run in parallel (one "layer"); their outputs are concatenated as released
+        self.dev = DeviationHead([h_feats * len(self.conv)], readout, h_feats) if parse_readout(readout)[0] else None
 
     def forward(self, graph):
         # in_feat = graph.ndata['feature']
@@ -209,6 +238,8 @@ class BWGNN(nn.Module):
             h0 = conv(graph, h)
             h_final = torch.cat([h_final, h0], -1)
         h_final = self.dropout(h_final)
+        if self.dev is not None:
+            return self.dev(graph, [h_final])
         h = self.mlp(h_final, False)
         h = graph_max_readout(graph, h)
         return h
@@ -216,41 +247,74 @@ class BWGNN(nn.Module):
 
 class GCN(nn.Module):
     def __init__(self, in_feats, h_feats=32, num_classes=2, num_layers=2, mlp_layers=1, dropout_rate=0,
-                 activation='ReLU', readout="max", **kwargs):
+                 activation='ReLU', readout="max", self_loop=False, **kwargs):
         super().__init__()
         self.modelName="GCN"
-        assert readout in ("max", "deviation", "deviation_cat", "deviation_nb", "deviation_cat_nb"), readout
-        self.readout = readout
         self.h_feats = h_feats
+        self.self_loop = self_loop  # True: A + I as in Kipf & Welling (dgl GraphConv adds none)
         self.layers = nn.ModuleList()
         self.act = getattr(nn, activation)()
         self.layers.append(dglnn.GraphConv(in_feats, h_feats, activation=self.act))
         for i in range(num_layers-1):
             self.layers.append(dglnn.GraphConv(h_feats, h_feats, activation=self.act))
-        mlp_in = h_feats * num_layers if readout.startswith("deviation_cat") else h_feats
-        self.mlp = MLP(mlp_in, h_feats, num_classes, mlp_layers, dropout_rate)
+        self.mlp = MLP(h_feats, h_feats, num_classes, mlp_layers, dropout_rate)
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+        self.dev = DeviationHead([h_feats] * num_layers, readout, h_feats) if parse_readout(readout)[0] else None
 
     def forward(self, graph):
         h = graph.ndata['feature'].to(dtype=torch.float)  # 转换为 float32
-        # h = graph.ndata['feature']
-        # print("h:",h)
+        g = dgl.add_self_loop(dgl.remove_self_loop(graph)) if self.self_loop else graph
         hs = []
         for i, layer in enumerate(self.layers):
             if i != 0:
                 h = self.dropout(h)
-            h = layer(graph, h)
+            h = layer(g, h)
             hs.append(h)
-        if self.readout.startswith("deviation"):
-            # paper Eq. 5 (AGG = mean over the L layers, or concatenation for *_cat), Eq. 6 (center minus the
-            # mean of all ego-graph nodes, or of the neighbours only for *_nb), Eq. 8 (MLP on the graph vector)
-            H = torch.cat(hs, -1) if "_cat" in self.readout else torch.stack(hs).mean(0)
-            ref = "neighbors" if self.readout.endswith("_nb") else "all"
-            return self.mlp(graph_deviation_readout(graph, H, ref), False)
+        if self.dev is not None:
+            return self.dev(graph, hs)
         h = self.mlp(h, False)
-        # print("h:",h)
         h = graph_max_readout(graph, h)
         return h
+
+
+class GCN_GAE(nn.Module):
+    """GCN pre-trained with the GAE framework on the entire graph (paper Sec. 4.1), applied to ego-graphs.
+
+    The encoder is the 2-layer PyG GCN of a baed-gae-train checkpoint (GCNConv adds self-loops):
+    E1 = act(conv1(X)), E2 = conv2(dropout(E1)). Detection uses the deviation readout (Eq. 5-8) with the
+    layers concatenated. freeze=True keeps the encoder fixed (and in eval mode); otherwise it is fine-tuned.
+    """
+
+    def __init__(self, in_feats, gae_path, h_feats=32, num_classes=2, readout="deviation_cat_nb", freeze=False,
+                 **kwargs):
+        super().__init__()
+        self.modelName = "GCN_GAE"
+        if not parse_readout(readout)[0]:
+            raise ValueError("GCN_GAE uses a deviation readout")
+        gae = torch.load(gae_path, map_location="cpu", weights_only=False)
+        self.encoder = gae.encoder
+        c1, c2 = self.encoder.conv1, self.encoder.conv2
+        assert c1.in_channels == in_feats, f"encoder expects {c1.in_channels} input features, got {in_feats}"
+        self.freeze = freeze
+        if freeze:
+            for p in self.encoder.parameters():
+                p.requires_grad_(False)
+        self.dev = DeviationHead([c1.out_channels, c2.out_channels], readout.replace("deviation_", "deviation_cat_")
+                                 if "_cat" not in readout else readout, h_feats)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze:
+            self.encoder.eval()
+        return self
+
+    def forward(self, graph):
+        x = graph.ndata['feature'].to(dtype=torch.float)
+        src, dst = graph.edges()
+        ei = torch.stack([src, dst]).long()
+        e1 = self.encoder.activation(self.encoder.conv1(x, ei))
+        e2 = self.encoder.conv2(self.encoder.dropout(e1), ei)
+        return self.dev(graph, [e1, e2])
 
 
 class RGCN(nn.Module):
@@ -379,7 +443,7 @@ class ChebNet(nn.Module):
 
 class GraphSAGE(nn.Module):
     def __init__(self, in_feats, h_feats=32, num_classes=2, num_layers=2, agg='pool', dropout_rate=0,
-                 activation='ReLU', **kwargs):
+                 activation='ReLU', readout="max", **kwargs):
         super(GraphSAGE, self).__init__()
         self.modelName="GraphSAGE"
         self.layers = nn.ModuleList()
@@ -389,13 +453,18 @@ class GraphSAGE(nn.Module):
             self.layers.append(dglnn.SAGEConv(h_feats, h_feats, agg, activation=self.act))
         self.output_linear = nn.Linear(h_feats, num_classes)
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+        self.dev = DeviationHead([h_feats] * num_layers, readout, h_feats) if parse_readout(readout)[0] else None
 
     def forward(self, graph):
         # h = graph.ndata['feature']
         h=graph.ndata['feature'].to(dtype=torch.float)
+        hs = []
         for layer in self.layers:
             h = self.dropout(h)
             h = layer(graph, h)
+            hs.append(h)
+        if self.dev is not None:
+            return self.dev(graph, hs)
         h = self.output_linear(h)
         h = graph_max_readout(graph, h)
         return h
