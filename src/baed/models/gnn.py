@@ -215,7 +215,7 @@ class GCN(nn.Module):
                  activation='ReLU', readout="max", **kwargs):
         super().__init__()
         self.modelName="GCN"
-        assert readout in ("max", "deviation"), readout
+        assert readout in ("max", "deviation", "deviation_cat"), readout
         self.readout = readout
         self.h_feats = h_feats
         self.layers = nn.ModuleList()
@@ -223,7 +223,8 @@ class GCN(nn.Module):
         self.layers.append(dglnn.GraphConv(in_feats, h_feats, activation=self.act))
         for i in range(num_layers-1):
             self.layers.append(dglnn.GraphConv(h_feats, h_feats, activation=self.act))
-        self.mlp = MLP(h_feats, h_feats, num_classes, mlp_layers, dropout_rate)
+        mlp_in = h_feats * num_layers if readout == "deviation_cat" else h_feats
+        self.mlp = MLP(mlp_in, h_feats, num_classes, mlp_layers, dropout_rate)
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
 
     def forward(self, graph):
@@ -240,6 +241,8 @@ class GCN(nn.Module):
             # paper Eq. 5 (AGG = mean over the L layers), Eq. 6 (center minus mean of the ego-graph),
             # Eq. 8 (MLP on the per-graph vector)
             return self.mlp(graph_deviation_readout(graph, torch.stack(hs).mean(0)), False)
+        if self.readout == "deviation_cat":  # same, with AGG = concatenation of the layers
+            return self.mlp(graph_deviation_readout(graph, torch.cat(hs, -1)), False)
         h = self.mlp(h, False)
         # print("h:",h)
         h = graph_max_readout(graph, h)

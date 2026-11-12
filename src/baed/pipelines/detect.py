@@ -706,9 +706,10 @@ def run(argv=None):
     parser.add_argument("--gen-chunk", type=int, default=1,
                         help="(--batched, --use-baed) sample the synthetic anomalies of K consecutive batches in one "
                              "diffusion call (4-5x faster); their guidance uses the detector at the start of the chunk")
-    parser.add_argument("--readout", default="max", choices=["max", "deviation"],
+    parser.add_argument("--readout", default="max", choices=["max", "deviation", "deviation_cat"],
                         help="max = released code (MLP per node, max over the ego-graph); deviation = paper Eq. 5-8 "
-                             "(mean over layers, center embedding minus the ego-graph mean, then MLP). GCN only")
+                             "(mean over layers, center embedding minus the ego-graph mean, then MLP); deviation_cat = "
+                             "the same with the layers concatenated (Eq. 5 allows mean or concatenation). GCN only")
     parser.add_argument("--agg-features", default="orig", choices=["orig", "recompute"],
                         help="(--batched, Elliptic) orig = the 166 released features; recompute = keep columns 0-93 "
                              "(timestep + local) and replace the precomputed aggregates 94-165 by max/min/mean/std of "
@@ -753,7 +754,7 @@ def run(argv=None):
 
     detector = build_detector(cli.model, cli.node_feats, cli.readout).to(device)
     optimizer = optim.Adam(detector.parameters(), lr=cli.lr)
-    tag = f"{cli.model}_{(cli.aug_gen.upper() if cli.use_baed else 'None')}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "") + ("_aggrc" if AGG_MODE == "recompute" else "") + (f"_gc{GEN_CHUNK}" if GEN_CHUNK > 1 else "") + ("_dev" if cli.readout == "deviation" else "")
+    tag = f"{cli.model}_{(cli.aug_gen.upper() if cli.use_baed else 'None')}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "") + ("_aggrc" if AGG_MODE == "recompute" else "") + (f"_gc{GEN_CHUNK}" if GEN_CHUNK > 1 else "") + {"max": "", "deviation": "_dev", "deviation_cat": "_devcat"}[cli.readout]
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
