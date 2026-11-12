@@ -447,8 +447,39 @@ def _batch(feats, edges, labels):
     g = dgl.graph((e[0], e[1]), num_nodes=off)
     g.set_batch_num_nodes(torch.tensor(nn_, device=device))
     g.set_batch_num_edges(torch.tensor(ne_, device=device))
-    g.ndata['feature'] = torch.cat(fs).to(device)
+    x = torch.cat(fs).to(device)
+    g.ndata['feature'] = recompute_aggregates(x.float(), e, off) if AGG_MODE == "recompute" else x
     return g, torch.tensor(ys, device=device), pos
+
+
+AGG_MODE = "orig"  # set by --agg-features
+N_LOCAL = 94       # Elliptic: column 0 = timestep, columns 1-93 = local features, 94-165 = aggregated
+AGG_DIM = N_LOCAL + 4 * (N_LOCAL - 1) + 1
+
+
+def recompute_aggregates(x, edge_index, num_nodes):
+    """Replace the precomputed 1-hop aggregates of Elliptic (columns 94-165, anonymised and computed on
+    the full graph) by statistics over the ego-graph's own edges, so that real (A) and generated
+    (A_hat) ego-graphs get their aggregates from the same function and the same edge set.
+
+    Per node: [timestep + 93 local features, max | min | mean | std of the 93 local features over the
+    1-hop neighbours (undirected, self-loops removed), log(1 + degree)]. No neighbour -> zeros.
+    """
+    import torch_scatter
+    loc = x[:, 1:N_LOCAL]
+    e = torch.cat([edge_index, edge_index.flip(0)], 1)
+    e = e[:, e[0] != e[1]]
+    e = torch.unique(e, dim=1)
+    src, dst = e
+    msg = loc[src]
+    kw = dict(dim=0, dim_size=num_nodes)
+    mx = torch_scatter.scatter(msg, dst, reduce="max", **kw)
+    mn = torch_scatter.scatter(msg, dst, reduce="min", **kw)
+    mean = torch_scatter.scatter(msg, dst, reduce="mean", **kw)
+    sq = torch_scatter.scatter(msg * msg, dst, reduce="mean", **kw)
+    std = (sq - mean * mean).clamp(min=0).sqrt()
+    deg = torch_scatter.scatter(torch.ones_like(dst, dtype=x.dtype), dst, reduce="sum", **kw)
+    return torch.cat([x[:, :N_LOCAL], mx, mn, mean, std, torch.log1p(deg)[:, None]], 1)
 
 
 def _guidance(gae, feats, edges, labels, losses):
@@ -633,11 +664,21 @@ def run(argv=None):
     parser.add_argument("--aug-gen", default="baed", choices=["baed", "ggad", "aegis"],
                         help="(--batched, with --use-baed) generator of synthetic anomalies: BAED diffusion, or the "
                              "GGAD / AEGIS baselines adapted to ego-graphs (see baed.aug_generators)")
+    parser.add_argument("--agg-features", default="orig", choices=["orig", "recompute"],
+                        help="(--batched, Elliptic) orig = the 166 released features; recompute = keep columns 0-93 "
+                             "(timestep + local) and replace the precomputed aggregates 94-165 by max/min/mean/std of "
+                             "the local features over the ego-graph's own 1-hop neighbours + log(1+degree), for real "
+                             f"and generated ego-graphs alike (node features become {AGG_DIM}-dim)")
     parser.add_argument("--data-tag", default="", help="ego-graph file suffix, e.g. _full -> <dataset>_full_init_0_1_dataset.pkl")
     parser.add_argument("--out", default=None, help="write metrics as JSON here")
     cli = parser.parse_args(argv)
-    global KEEP_ISOLATED
+    global KEEP_ISOLATED, AGG_MODE
     KEEP_ISOLATED = cli.keep_isolated
+    AGG_MODE = cli.agg_features
+    if AGG_MODE == "recompute":
+        if not cli.batched:
+            parser.error("--agg-features recompute requires --batched")
+        cli.node_feats = AGG_DIM  # detector input; the guidance encoder and generator keep the raw 166 features
     AUG.update(gen_noise=cli.gen_noise, curriculum=cli.curriculum, alpha=cli.cur_alpha, beta=cli.cur_beta)
     if cli.keep_isolated and not cli.batched:
         parser.error("--keep-isolated requires --batched")
@@ -666,7 +707,7 @@ def run(argv=None):
 
     detector = build_detector(cli.model, cli.node_feats).to(device)
     optimizer = optim.Adam(detector.parameters(), lr=cli.lr)
-    tag = f"{cli.model}_{(cli.aug_gen.upper() if cli.use_baed else 'None')}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "")
+    tag = f"{cli.model}_{(cli.aug_gen.upper() if cli.use_baed else 'None')}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "") + ("_aggrc" if AGG_MODE == "recompute" else "")
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
