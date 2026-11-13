@@ -840,6 +840,9 @@ def run(argv=None):
     optimizer = optim.Adam(detector.parameters(), lr=cli.lr)
     tag = f"{cli.model}_{(cli.aug_gen.upper() if cli.use_baed else 'None')}_s{cli.seed}" + ("_b" if cli.batched else "") + ("_rand" if cli.split == "random" else "") + ("_iso" if cli.keep_isolated else "") + ("_paug" if cli.gen_noise or cli.curriculum != "linear" else "") + (f"_dyn{cli.dynamic_segments}" if cli.dynamic_segments else "") + ("_aggrc" if AGG_MODE == "recompute" else "") + (f"_gc{GEN_CHUNK}" if GEN_CHUNK > 1 else "") + ("_cfill" if cli.gen_center_fill else "") + ("_sl" if cli.gcn_self_loop else "") + ("_frz" if cli.freeze_gnn else "") + {"max": "", "deviation": "_dev", "deviation_cat": "_devcat", "deviation_nb": "_devnb",
                                                                    "deviation_cat_nb": "_devcatnb"}[cli.readout]
+    # learning rate and ego-graph data in the weight-file name: parallel runs that differ only in these would
+    # otherwise write (and test from) the same .pth file
+    tag += (f"_lr{cli.lr:g}" if cli.lr != 1e-3 else "") + (cli.data_tag if cli.data_tag not in ("", "_full") else "")
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
