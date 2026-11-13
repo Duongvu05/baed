@@ -209,7 +209,8 @@ class DiffusionBase(torch.nn.Module):
         num_edges = batched_graph.edges_per_graph.sum()
         batched_graph = self._prepare_data_for_sampling(batched_graph)
 
-        if getattr(self, "fast_sampling", False) and str(self.device).startswith("cuda") and embedding is not None:
+        if (getattr(self, "fast_sampling", False) and str(self.device).startswith("cuda") and embedding is not None
+                and int(num_edges) <= self.CG_MAX_EDGES):
             self._sample_loop_cuda_graph(batched_graph, embedding, int(num_nodes), int(num_edges))
         else:
             self._sample_loop(batched_graph, embedding, num_nodes, num_edges)
@@ -228,7 +229,16 @@ class DiffusionBase(torch.nn.Module):
 
     @staticmethod
     def _bucket(n, step):
-        return ((n + step - 1) // step) * step
+        """Round n up to a multiple of step, then to 3 significant bits (at most ~12% padding): the number of distinct
+        buckets grows with log(size) instead of size, which matters for datasets with large ego-graphs."""
+        n = ((n + step - 1) // step) * step
+        shift = max(n.bit_length() - 3, 0)
+        return ((n + (1 << shift) - 1) >> shift) << shift
+
+    # CUDA-graph sampling: larger batches run the eager loop (launch overhead is negligible there, and every
+    # captured bucket keeps its own memory pool); at most CG_CACHE_MAX buckets are kept, least recently used dropped
+    CG_MAX_EDGES = 1 << 18
+    CG_CACHE_MAX = 12
 
     @torch.no_grad()
     def _sample_loop_cuda_graph(self, batched_graph, embedding, num_nodes, num_edges):
@@ -248,8 +258,12 @@ class DiffusionBase(torch.nn.Module):
         key = (Nc, Ec, Bc, embedding is None, emb_per_graph)
         cache = self.__dict__.setdefault("_cg_cache", {})
         if key not in cache:
+            while len(cache) >= self.CG_CACHE_MAX:
+                cache.pop(next(iter(cache)))  # least recently used (dict keeps insertion order, see below)
+                torch.cuda.empty_cache()
             cache[key] = self._capture_bucket(Nc, Ec, Bc, batched_graph, embedding)
-        c = cache[key]
+        c = cache.pop(key)
+        cache[key] = c  # move to the end: most recently used
         st = c["static"]
         # load the real batch into the static buffers, padding = one extra graph (index B)
         st.feature.zero_(); st.feature[:num_nodes].copy_(batched_graph.feature)
