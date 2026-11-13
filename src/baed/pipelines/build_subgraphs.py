@@ -189,12 +189,18 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
 
 
 def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
-                      bidirectional: bool = False, drop_unlabelled: bool = False) -> None:
+                      bidirectional: bool = False, drop_unlabelled: bool = False, node_time: bool = False) -> None:
     """Build and save one ego-graph dataset (name kept from the original code)."""
     t0 = time.time()
     nx_graphs = build(dataset, label_type, backend=backend, elliptic_full=elliptic_full, bidirectional=bidirectional,
                       drop_unlabelled=drop_unlabelled)
-    tag = ("_full" if elliptic_full else "") + ("_lab" if drop_unlabelled else "") + ("_bi" if bidirectional else "")
+    if node_time:
+        # order the ego-graphs by the appearance time of their center (stable), so the sequential 70/15/15 split
+        # of the detector is a temporal split, as on Elliptic
+        t = np.load(paths.graph_file(f"{dataset}_node_time.npy"))
+        nx_graphs = [g for _, g in sorted(((t[next(iter(g.nodes))], g) for g in nx_graphs), key=lambda p: p[0])]
+        logger.info(f"ego-graphs ordered by center time ({dataset}_node_time.npy)")
+    tag = ("_full" if elliptic_full else "") + ("_lab" if drop_unlabelled else "") + ("_t" if node_time else "") + ("_bi" if bidirectional else "")
     out = output_file(dataset, label_type, tag=tag)
     with open(out, "wb") as f:
         pkl.dump(nx_graphs, f)
@@ -212,6 +218,9 @@ def main(argv=None):
     parser.add_argument("--drop-unlabelled", action="store_true",
                         help="non-temporal datasets: remove the nodes labelled neither 0 nor 1 (DGraph background) "
                              "before extracting ego-graphs, as for Elliptic; adds _lab to the file name")
+    parser.add_argument("--node-time", action="store_true",
+                        help="order the ego-graphs by data/graphs/<dataset>_node_time.npy (scripts/make_node_time.py), "
+                             "so the sequential split is temporal; adds _t to the file name")
     parser.add_argument("--bidirectional", action="store_true",
                         help="ego-graphs over in- and out-edges (original: out-edges only); adds _bi to the file name")
     args = parser.parse_args(argv)
@@ -220,7 +229,8 @@ def main(argv=None):
             initOriginDataset(dataset, label_type, backend=args.backend,
                               elliptic_full=args.elliptic_full and dataset == "elliptic",
                               bidirectional=args.bidirectional,
-                              drop_unlabelled=args.drop_unlabelled and dataset != "elliptic")
+                              drop_unlabelled=args.drop_unlabelled and dataset != "elliptic",
+                              node_time=args.node_time and dataset != "elliptic")
 
 
 if __name__ == "__main__":
