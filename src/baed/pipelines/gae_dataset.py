@@ -128,6 +128,24 @@ def load_elliptic_whole():
     return Data(x=x, edge_index=edge_index, y=torch.tensor(y))
 
 
+def load_whole_static(dataset):
+    """Whole graph of a non-temporal dataset for pre-training the guidance encoder (link prediction, no
+    labels): every node (DGraph background nodes included, as the unknown Elliptic nodes are in
+    load_elliptic_whole), every edge made undirected, self-loops removed, and the node features of the
+    ego-graphs (same loader as baed-build-subgraphs)."""
+    from torch_geometric.utils import remove_self_loops, to_undirected
+    from baed.pipelines.build_subgraphs import load_full_graph
+
+    graph, labels = load_full_graph(dataset)
+    src, dst = graph.edges()
+    edge_index, _ = remove_self_loops(torch.stack([src, dst]).long())
+    edge_index = to_undirected(edge_index, num_nodes=graph.num_nodes())
+    x = graph.ndata["feature"].to(torch.float32)
+    y = torch.where((labels == 0) | (labels == 1), labels, torch.full_like(labels, -1))
+    print(f"{dataset} whole graph: nodes {graph.num_nodes()}, undirected edges {edge_index.size(1) // 2}, features {x.shape[1]}")
+    return Data(x=x, edge_index=edge_index, y=y)
+
+
 def load_elliptic_inductive(train_ratio=0.7, eval_ratio=0.15, future_holdout=0.2, seed=0):
     """Elliptic link-prediction data for pre-training the guidance encoder without test leakage.
 
@@ -342,12 +360,11 @@ def main(argv=None):
                         help="elliptic: fixed node ids, all 49 timesteps, train-split nodes only (+ future-period eval)")
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--whole", action="store_true",
-                        help="elliptic: whole graph (all 49 timesteps, labelled + unknown nodes, fixed node ids)")
+                        help="whole graph, all nodes (elliptic: all 49 timesteps, labelled + unknown, fixed node ids)")
     args = parser.parse_args(argv)
 
     if args.whole:
-        assert args.dataset == "elliptic", "--whole is implemented for elliptic"
-        data = load_elliptic_whole()
+        data = load_elliptic_whole() if args.dataset == "elliptic" else load_whole_static(args.dataset)
     elif args.inductive:
         assert args.dataset == "elliptic", "--inductive is implemented for elliptic"
         data = load_elliptic_inductive(train_ratio=args.train_ratio)

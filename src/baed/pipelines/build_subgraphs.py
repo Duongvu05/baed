@@ -54,6 +54,64 @@ def adj_to_dgl_graph(adj):
     return dgl.from_networkx(nx_graph)
 
 
+# ego-graph radius of the released code for the datasets loaded as one static graph
+FULL_GRAPH_HOPS = {"dgraph": 2, "tfinance": 1, "photo": 1, "reddit": 1, "Amazon": 1}
+
+
+def load_full_graph(dataset: str):
+    """The whole graph of a non-temporal dataset: DGL graph with ndata 'feature' (float) and 'label' (as
+    stored), plus integer node labels (T-Finance stores one-hot labels). Self-loops are removed (the .mat
+    adjacencies carry one on every node; Elliptic has none, and with a self-loop both nodes of a 2-node
+    ego-graph get the same embedding, so the deviation readout gives 0). Shared by the ego-graph builder and
+    the GAE pre-training (baed-gae-dataset --whole), so the guidance encoder sees the ego-graph features."""
+    graph, labels = _load_full_graph(dataset)
+    n_loops = int((graph.edges()[0] == graph.edges()[1]).sum())
+    if n_loops:
+        graph = dgl.remove_self_loop(graph)
+        logger.info(f"{dataset}: removed {n_loops} self-loops")
+    return graph, labels
+
+
+def _load_full_graph(dataset: str):
+    if dataset == "dgraph":
+        item = np.load(paths.graph_file("dgraphfin.npz"))
+        edge_index = item["edge_index"]
+        graph = dgl.graph(
+            (torch.tensor(edge_index[:, 0], dtype=torch.int64), torch.tensor(edge_index[:, 1], dtype=torch.int64)),
+            num_nodes=len(item["y"]),
+        )
+        graph.ndata["feature"] = torch.tensor(item["x"], dtype=torch.float32)
+        graph.ndata["label"] = torch.tensor(item["y"], dtype=torch.int64)
+        return graph, graph.ndata["label"]
+    if dataset == "tfinance":
+        graph = load_graphs(str(paths.graph_file("tfinance")))[0][0]
+        graph.ndata["feature"] = graph.ndata["feature"].to(torch.float32)
+        return graph, graph.ndata["label"].argmax(1)  # one-hot -> int (node attribute stays one-hot)
+    if dataset in ["photo", "reddit", "Amazon"]:
+        data = sio.loadmat(str(paths.graph_file(f"{dataset}.mat")))
+        label = data.get("Label", data.get("gnd"))
+        attr = data.get("Attributes", data.get("X"))
+        network = data.get("Network", data.get("A"))
+        adj = sp.csr_matrix(network)
+        features = preprocess_features(sp.lil_matrix(attr))
+        graph = adj_to_dgl_graph(adj)
+        graph.ndata["feature"] = torch.tensor(features, dtype=torch.float32)
+        graph.ndata["label"] = torch.tensor(np.squeeze(np.array(label)), dtype=torch.int64)
+        return graph, graph.ndata["label"]
+    raise ValueError(f"unsupported dataset: {dataset}")
+
+
+def labelled_subgraph(graph, labels):
+    """Drop the nodes whose label is not 0 or 1 (DGraph background nodes) and every edge touching them,
+    the same rule as the labelled-only Elliptic ego-graphs. Node order is kept, so the centers keep
+    their relative order (and the sequential split its meaning)."""
+    keep = torch.nonzero((labels == 0) | (labels == 1), as_tuple=True)[0]
+    sub = dgl.node_subgraph(graph, keep)
+    logger.info(f"labelled subgraph: {sub.num_nodes()} of {graph.num_nodes()} nodes, {sub.num_edges()} of "
+                f"{graph.num_edges()} edges")
+    return sub, labels[keep]
+
+
 def select_centers(labels: torch.Tensor, label_type: str) -> list[int]:
     if label_type == "label_1":
         mask = labels == 1
@@ -90,18 +148,16 @@ def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto"
 
 
 def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
-          bidirectional: bool = False) -> list[nx.Graph]:
+          bidirectional: bool = False, drop_unlabelled: bool = False) -> list[nx.Graph]:
     logger.info(f"dataset={dataset} label_type={label_type}")
 
-    if dataset == "dgraph":
-        item = np.load(paths.graph_file("dgraphfin.npz"))
-        edge_index = item["edge_index"]
-        graph = dgl.graph(
-            (torch.tensor(edge_index[:, 0], dtype=torch.int64), torch.tensor(edge_index[:, 1], dtype=torch.int64))
-        )
-        graph.ndata["feature"] = torch.tensor(item["x"], dtype=torch.float32)
-        graph.ndata["label"] = torch.tensor(item["y"], dtype=torch.int64)
-        return ego_from_dgl(graph, graph.ndata["label"], label_type, hops=2, backend=backend, bidirectional=bidirectional)
+    if dataset in FULL_GRAPH_HOPS:
+        graph, labels = load_full_graph(dataset)
+        if drop_unlabelled:
+            graph, labels = labelled_subgraph(graph, labels)
+        return ego_from_dgl(graph, labels, label_type, hops=FULL_GRAPH_HOPS[dataset],
+                            max_nodes=1200 if dataset == "tfinance" else None, backend=backend,
+                            bidirectional=bidirectional)
 
     if dataset == "elliptic":
         nx_graphs = []
@@ -129,32 +185,16 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
             nx_graphs += ego_from_dgl(graph, node_labels, label_type, hops=2, backend=backend, bidirectional=bidirectional)
         return nx_graphs
 
-    if dataset == "tfinance":
-        graph = load_graphs(str(paths.graph_file("tfinance")))[0][0]
-        labels = graph.ndata["label"].argmax(1)  # one-hot -> int (node attribute stays one-hot)
-        return ego_from_dgl(graph, labels, label_type, hops=1, max_nodes=1200, backend=backend, bidirectional=bidirectional)
-
-    if dataset in ["photo", "reddit", "Amazon"]:
-        data = sio.loadmat(str(paths.graph_file(f"{dataset}.mat")))
-        label = data.get("Label", data.get("gnd"))
-        attr = data.get("Attributes", data.get("X"))
-        network = data.get("Network", data.get("A"))
-        adj = sp.csr_matrix(network)
-        features = preprocess_features(sp.lil_matrix(attr))
-        graph = adj_to_dgl_graph(adj)
-        graph.ndata["feature"] = torch.tensor(features, dtype=torch.float32)
-        graph.ndata["label"] = torch.tensor(np.squeeze(np.array(label)), dtype=torch.int64)
-        return ego_from_dgl(graph, graph.ndata["label"], label_type, hops=1, backend=backend, bidirectional=bidirectional)
-
     raise ValueError(f"unsupported dataset: {dataset}")
 
 
 def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
-                      bidirectional: bool = False) -> None:
+                      bidirectional: bool = False, drop_unlabelled: bool = False) -> None:
     """Build and save one ego-graph dataset (name kept from the original code)."""
     t0 = time.time()
-    nx_graphs = build(dataset, label_type, backend=backend, elliptic_full=elliptic_full, bidirectional=bidirectional)
-    tag = ("_full" if elliptic_full else "") + ("_bi" if bidirectional else "")
+    nx_graphs = build(dataset, label_type, backend=backend, elliptic_full=elliptic_full, bidirectional=bidirectional,
+                      drop_unlabelled=drop_unlabelled)
+    tag = ("_full" if elliptic_full else "") + ("_lab" if drop_unlabelled else "") + ("_bi" if bidirectional else "")
     out = output_file(dataset, label_type, tag=tag)
     with open(out, "wb") as f:
         pkl.dump(nx_graphs, f)
@@ -169,6 +209,9 @@ def main(argv=None):
     parser.add_argument("--elliptic-full", action="store_true",
                         help="Elliptic: keep all 49 timesteps (fixes two quirks of the original code); "
                              "writes elliptic_full_init_*_dataset.pkl")
+    parser.add_argument("--drop-unlabelled", action="store_true",
+                        help="non-temporal datasets: remove the nodes labelled neither 0 nor 1 (DGraph background) "
+                             "before extracting ego-graphs, as for Elliptic; adds _lab to the file name")
     parser.add_argument("--bidirectional", action="store_true",
                         help="ego-graphs over in- and out-edges (original: out-edges only); adds _bi to the file name")
     args = parser.parse_args(argv)
@@ -176,7 +219,8 @@ def main(argv=None):
         for label_type in args.label_type:
             initOriginDataset(dataset, label_type, backend=args.backend,
                               elliptic_full=args.elliptic_full and dataset == "elliptic",
-                              bidirectional=args.bidirectional)
+                              bidirectional=args.bidirectional,
+                              drop_unlabelled=args.drop_unlabelled and dataset != "elliptic")
 
 
 if __name__ == "__main__":

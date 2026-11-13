@@ -142,8 +142,10 @@ def get_data(args):
         test_evaluator = GenericGraphEvaluator(test_nx_graphs, device=args.device)
 
         monitoring_statistics = ['clustering_mmd', 'orbits_mmd', 'spectral_mmd', 'degree_mmd', 'mmd_linear', 'mmd_rbf']
-    elif args.dataset == "elliptic":
-        print("正在初始化elliptic数据集")
+    # one code path for every ego-graph dataset (the released per-dataset copies trained on the anomalies of
+    # all splits, without --data_tag, used hard-coded GAE files, and T-Finance kept only 100 graphs)
+    elif args.dataset in ("elliptic", "dgraph", "reddit", "photo", "tfinance", "Amazon"):
+        print(f"loading {args.dataset}{getattr(args, 'data_tag', '')} anomalous ego-graphs")
         repeat = 64 
         num_node_classes = None
         num_edge_classes = 2
@@ -161,10 +163,12 @@ def get_data(args):
 
         max_degree = max([max([d for n, d in train_nx_graph.degree()]) for train_nx_graph in train_nx_graphs])
         # # 加载GAE模型
-        model = torch.load(str(paths.gae_weight(getattr(args, 'guidance_encoder', None) or "elliptic_gae_relu_256.pt")))
+        assert getattr(args, 'guidance_encoder', None), "--guidance_encoder is required"
+        model = torch.load(str(paths.gae_weight(args.guidance_encoder)))
+        num_cols = len(next(iter(nx_graphs[0].nodes(data=True)))[1]["feature"])  # 166 on Elliptic
         # 增加子图的节点特征属性
         featureNameList=["label","feature"]
-        for i in range(166):
+        for i in range(num_cols):
             featureNameList.append(f"feature{i}")
         for nx_graph in train_nx_graphs:
             pyg_data = preprocess(nx_graph ,model,degree=args.degree,augmented_features=featureNameList,device=args.device)
