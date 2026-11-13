@@ -793,6 +793,25 @@ class TGNN_gin_guided(torch.nn.Module):
         return conv.nn(aggr + (1 + conv.eps) * x)
 
     @staticmethod
+    def _masked_gcn(conv, x, src, dst, m, n):
+        """PyG GCNConv(x, A^t) (add_self_loops, normalize, not improved) with A^t given as a 0/1 mask:
+        D^-1/2 (A^t + I) D^-1/2 x W + b, D the in-degree of A^t + I (A^t has no self-loops)."""
+        assert conv.add_self_loops and conv.normalize and not conv.improved, "only the default GCNConv is implemented"
+        xw = conv.lin(x)
+        dis = (_seg_sum(m, dst, n) + 1.0).rsqrt()  # degree with the self-loop, never 0
+        out = _seg_sum(xw[src] * (dis[src] * m * dis[dst])[:, None], dst, n) + xw * (dis * dis)[:, None]
+        return out + conv.bias if conv.bias is not None else out
+
+    @classmethod
+    def _masked_conv(cls, conv, x, src, dst, m, n):
+        """Masked version of the guidance-encoder layer (GINConv or GCNConv)."""
+        if isinstance(conv, pyg.nn.GCNConv):
+            return cls._masked_gcn(conv, x, src, dst, m, n)
+        if isinstance(conv, pyg.nn.GINConv):
+            return cls._masked_gin(conv, x, src, dst, m, n)
+        raise NotImplementedError(f"static sampling path: no masked version of {type(conv).__name__}")
+
+    @staticmethod
     def _masked_transformer_conv(conv, x, src, dst, m, n):
         """PyG TransformerConv (concat=False, root_weight, no beta / edge features) restricted to masked edges."""
         H, C = conv.heads, conv.out_channels
@@ -824,8 +843,8 @@ class TGNN_gin_guided(torch.nn.Module):
         enc.eval()
         ge = enc.encoder
         x = pyg_data.feature.float()
-        z_t = self._masked_gin(ge.conv2, ge.dropout(ge.activation(self._masked_gin(ge.conv1, x, src, dst, mf, n))),
-                               src, dst, mf, n)
+        z_t = self._masked_conv(ge.conv2, ge.dropout(ge.activation(self._masked_conv(ge.conv1, x, src, dst, mf, n))),
+                                src, dst, mf, n)
         e_t = _seg_max(z_t, batch, b)
         if embedding is not None:
             h_g = embedding.detach().to(z_t.device, torch.float)
