@@ -35,12 +35,19 @@ def read_elliptic(data_dir: str):
     return classes, edgelist, features
 
 
-def iter_timesteps(data_dir: str, start_ts: int, end_ts: int, node_order: str = "set") -> Iterator[EllipticTimestep]:
+def iter_timesteps(data_dir: str, start_ts: int, end_ts: int, node_order: str = "set",
+                   labelled_only: bool = True) -> Iterator[EllipticTimestep]:
     """Yield the labelled sub-graph of each timestep in ``[start_ts, end_ts)``.
 
     ``node_order`` reproduces the two variants of the original code:
       * ``"set"``  - ``createSubGraphDataset`` iterated ``set(features_ts.index)``
       * ``"file"`` - ``gae/saveGAEdataset`` iterated ``list(features_ts.index)``
+
+    ``labelled_only=False`` keeps the unlabelled ("unknown") transactions and every edge touching them,
+    as in the paper's ego-graph definition (all nodes reachable within K hops). The labelled transactions
+    come first, in the same order as with ``labelled_only=True`` (same centers in the same order, so the
+    sequential split is unchanged), followed by the unlabelled ones in file order. ``classes`` then
+    contains 'unknown' rows.
     """
     classes, edgelist, features = read_elliptic(data_dir)
     labelled_tx = set(classes.index[classes["class"] != "unknown"])
@@ -48,6 +55,8 @@ def iter_timesteps(data_dir: str, start_ts: int, end_ts: int, node_order: str = 
         features_ts = features[features[1] == ts + 1]
         tx_ts = set(features_ts.index) if node_order == "set" else list(features_ts.index)
         tx_ids = [tx for tx in tx_ts if tx in labelled_tx]
+        if not labelled_only:
+            tx_ids += [tx for tx in features_ts.index if tx not in labelled_tx]
         pos = pd.Series(np.arange(len(tx_ids), dtype=np.int64), index=pd.Index(tx_ids))
         e = edgelist[edgelist["txId1"].isin(pos.index) & edgelist["txId2"].isin(pos.index)]
         pairs = np.stack([pos.loc[e["txId1"]].to_numpy(), pos.loc[e["txId2"]].to_numpy()], axis=1)

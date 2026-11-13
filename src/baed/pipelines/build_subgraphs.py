@@ -89,7 +89,7 @@ def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto"
     )
 
 
-def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
+def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False, elliptic_all_nodes: bool = False,
           bidirectional: bool = False) -> list[nx.Graph]:
     logger.info(f"dataset={dataset} label_type={label_type}")
 
@@ -108,14 +108,18 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
         # elliptic_full: use all 49 timesteps (the original loop range(1, 49) with ts + 1 skips
         # timestep 1) and give the DGL graph all labelled nodes, so no timestep is dropped.
         start = 0 if elliptic_full else 1
-        for step in iter_timesteps(str(paths.graph_file("elliptic_bitcoin_dataset")), start, 49, node_order="set"):
+        # elliptic_all_nodes: keep the unlabelled transactions as ego-graph members (paper Sec. 3: all nodes
+        # reachable within K hops). They get label 2, so they are never centers (centers have label 0 or 1).
+        for step in iter_timesteps(str(paths.graph_file("elliptic_bitcoin_dataset")), start, 49, node_order="set",
+                                   labelled_only=not elliptic_all_nodes):
             if len(step.tx_ids) == 0:
                 continue
             num_nodes = len(step.tx_ids) if elliptic_full else None
             graph = dgl.graph((torch.from_numpy(step.src), torch.from_numpy(step.dst)), num_nodes=num_nodes)
             node_features = torch.tensor(step.features.values, dtype=torch.float32)
             node_labels = torch.tensor(
-                step.classes["class"].apply(lambda x: 1 if x == "1" else 0).values, dtype=torch.int64
+                step.classes["class"].apply(lambda x: 1 if x == "1" else (2 if x == "unknown" else 0)).values,
+                dtype=torch.int64,
             )
             # Original behaviour: a timestep is used only if the DGL graph built from the
             # edge list covers every labelled node (i.e. the highest-index node has an edge).
@@ -150,11 +154,12 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
 
 
 def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
-                      bidirectional: bool = False) -> None:
+                      bidirectional: bool = False, elliptic_all_nodes: bool = False) -> None:
     """Build and save one ego-graph dataset (name kept from the original code)."""
     t0 = time.time()
-    nx_graphs = build(dataset, label_type, backend=backend, elliptic_full=elliptic_full, bidirectional=bidirectional)
-    tag = ("_full" if elliptic_full else "") + ("_bi" if bidirectional else "")
+    nx_graphs = build(dataset, label_type, backend=backend, elliptic_full=elliptic_full, bidirectional=bidirectional,
+                      elliptic_all_nodes=elliptic_all_nodes)
+    tag = ("_full" if elliptic_full else "") + ("_all" if elliptic_all_nodes else "") + ("_bi" if bidirectional else "")
     out = output_file(dataset, label_type, tag=tag)
     with open(out, "wb") as f:
         pkl.dump(nx_graphs, f)
@@ -169,6 +174,9 @@ def main(argv=None):
     parser.add_argument("--elliptic-full", action="store_true",
                         help="Elliptic: keep all 49 timesteps (fixes two quirks of the original code); "
                              "writes elliptic_full_init_*_dataset.pkl")
+    parser.add_argument("--elliptic-all-nodes", action="store_true",
+                        help="Elliptic: keep the unlabelled transactions (and their edges) inside the ego-graphs; "
+                             "centers stay the labelled ones; adds _all to the file name")
     parser.add_argument("--bidirectional", action="store_true",
                         help="ego-graphs over in- and out-edges (original: out-edges only); adds _bi to the file name")
     args = parser.parse_args(argv)
@@ -176,7 +184,8 @@ def main(argv=None):
         for label_type in args.label_type:
             initOriginDataset(dataset, label_type, backend=args.backend,
                               elliptic_full=args.elliptic_full and dataset == "elliptic",
-                              bidirectional=args.bidirectional)
+                              bidirectional=args.bidirectional,
+                              elliptic_all_nodes=args.elliptic_all_nodes and dataset == "elliptic")
 
 
 if __name__ == "__main__":
