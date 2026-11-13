@@ -280,13 +280,15 @@ class GCN(nn.Module):
 class GCN_GAE(nn.Module):
     """GCN pre-trained with the GAE framework on the entire graph (paper Sec. 4.1), applied to ego-graphs.
 
-    The encoder is the 2-layer PyG GCN of a baed-gae-train checkpoint (GCNConv adds self-loops):
+    The encoder is the 2-layer PyG GCN of a baed-gae-train checkpoint:
     E1 = act(conv1(X)), E2 = conv2(dropout(E1)). Detection uses the deviation readout (Eq. 5-8) with the
     layers concatenated. freeze=True keeps the encoder fixed (and in eval mode); otherwise it is fine-tuned.
+    self_loop=False (default) convolves on D^-1/2 A D^-1/2 instead of the A + I the GAE was pre-trained with:
+    with A + I both nodes of a 2-node ego-graph get the same embedding and the deviation is exactly 0.
     """
 
     def __init__(self, in_feats, gae_path, h_feats=32, num_classes=2, readout="deviation_cat_nb", freeze=False,
-                 **kwargs):
+                 self_loop=False, **kwargs):
         super().__init__()
         self.modelName = "GCN_GAE"
         if not parse_readout(readout)[0]:
@@ -295,6 +297,9 @@ class GCN_GAE(nn.Module):
         self.encoder = gae.encoder
         c1, c2 = self.encoder.conv1, self.encoder.conv2
         assert c1.in_channels == in_feats, f"encoder expects {c1.in_channels} input features, got {in_feats}"
+        self.self_loop = self_loop
+        for c in (c1, c2):
+            c.add_self_loops = self_loop  # gcn_norm: isolated nodes get degree 0, masked to weight 0 by PyG
         self.freeze = freeze
         if freeze:
             for p in self.encoder.parameters():

@@ -693,7 +693,7 @@ def build_detector(name, nodes_feats, readout="max", self_loop=False, gnn_init=N
     if name == "GCN":
         return GCN(self_loop=self_loop, **kw)
     if name == "GCN_GAE":
-        return GCN_GAE(gae_path=gnn_init, freeze=freeze_gnn, **kw)
+        return GCN_GAE(gae_path=gnn_init, freeze=freeze_gnn, self_loop=self_loop, **kw)
     if name == "GIN":
         return GIN(in_feats=nodes_feats)
     if name == "GraphSAGE":
@@ -766,7 +766,8 @@ def run(argv=None):
                              "(mean over layers, center embedding minus the ego-graph mean, then MLP); deviation_cat = "
                              "the same with the layers concatenated (Eq. 5 allows mean or concatenation); *_nb subtracts the mean "
                              "of the neighbours instead of all nodes. Every detector uses a 2-layer MLP after a deviation readout")
-    parser.add_argument("--gcn-self-loop", action="store_true", help="GCN: convolve on A + I (Kipf & Welling)")
+    parser.add_argument("--gcn-self-loop", action="store_true",
+                        help="GCN / GCN_GAE: convolve on A + I (Kipf & Welling). Default off: A only")
     parser.add_argument("--gnn-init", default="elliptic_gae_relu_256_whole.pt",
                         help="GCN_GAE: GAE checkpoint (weights/gae/) whose GCN encoder was trained on the whole graph")
     parser.add_argument("--freeze-gnn", action="store_true", help="GCN_GAE: keep the pre-trained encoder fixed")
