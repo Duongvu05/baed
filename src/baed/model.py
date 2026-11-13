@@ -23,6 +23,20 @@ def add_model_args(parser):
     parser.add_argument('--noise_schedule', type=str, default='cosine', help='cosine | linear')
     parser.add_argument('--norm', type=str, default='None', help='None | BN' )
     
+def _encoder_out_dim(guidance_encoder):
+    """Output size of a GAE checkpoint's encoder (the last layer that declares one)."""
+    from baed import paths
+    enc = torch.load(str(paths.gae_weight(guidance_encoder)), map_location="cpu", weights_only=False).encoder
+    out = None
+    for m in enc.modules():
+        if isinstance(m, nn.Linear):
+            out = m.out_features
+        elif hasattr(m, "out_channels"):
+            out = m.out_channels
+    assert out, f"cannot read the output size of {guidance_encoder}"
+    return int(out)
+
+
 def get_model_id(args):
     return 'multinomial_diffusion'
 
@@ -72,6 +86,10 @@ def get_model(args, initial_graph_sampler):
         embedding_dim=128
     elif args.dataset=="photo":  # matches photo_gae_relu_896.pt
         embedding_dim=896
+    if args.arch == 'TGNN_gin_guided':
+        # the denoiser reads the guidance encoder's embeddings: take their size from the encoder itself
+        # (256 for every <dataset>_gin_relu_256_whole.pt) instead of the released per-dataset table
+        embedding_dim = _encoder_out_dim(args.guidance_encoder)
     dynamics = dynamics_fn(
             dataset=args.dataset,
             max_degree=args.max_degree,
