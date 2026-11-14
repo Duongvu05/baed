@@ -790,6 +790,10 @@ def run(argv=None):
                              f"and generated ego-graphs alike (node features become {AGG_DIM}-dim)")
     parser.add_argument("--data-tag", default="", help="ego-graph file suffix, e.g. _full -> <dataset>_full_init_0_1_dataset.pkl")
     parser.add_argument("--out", default=None, help="write metrics as JSON here")
+    parser.add_argument("--lean", action="store_true",
+                        help="per-sample (released) training read from the lean tensor cache instead of networkx "
+                             "graphs + preprocessDataset: same features and edges, no 10 s per-graph timeout, much less "
+                             "memory (needed for large ego-graphs, e.g. 2-hop Reddit)")
     parser.add_argument("--weight-suffix", default="", help="appended to the detector weight-file name (outputs/detect_weights)")
     cli = parser.parse_args(argv)
     global KEEP_ISOLATED, AGG_MODE, GEN_CHUNK, CENTER_FILL, GEN_HOPS, GEN_MAX_TRIES
@@ -811,7 +815,7 @@ def run(argv=None):
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     gae = torch.load(str(paths.gae_weight(cli.gae_weight or f'{dataset}_gae_relu_128.pt')), map_location=device)
     dataset_path = str(paths.graph_file(f"{dataset}{cli.data_tag}_init_0_1_dataset.pkl"))
-    if cli.batched:
+    if cli.batched or cli.lean:
         from baed.datasets.lean import keep, lean_collate, load_lean
 
         nx_graphs = load_lean(dataset_path, lambda: load_dataset(dataset_path), paths.root() / "data" / "cache")
@@ -844,13 +848,13 @@ def run(argv=None):
     # learning rate and ego-graph data in the weight-file name: parallel runs that differ only in these would
     # otherwise write (and test from) the same .pth file
     tag += (f"_lr{cli.lr:g}" if cli.lr != 1e-3 else "") + (cli.data_tag if cli.data_tag not in ("", "_full") else "")
-    tag += cli.weight_suffix  # e.g. the diffusion variant, so runs that differ only in the generator do not collide
+    tag += ("_lean" if cli.lean and not cli.batched else "") + cli.weight_suffix  # e.g. the diffusion variant, so runs that differ only in the generator do not collide
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
     def loaders(train_nx, eval_nx, test_nx):
         nonlocal generator
-        if cli.batched:
+        if cli.batched or cli.lean:
             sets = [[it for it in x if keep(it, cli.keep_isolated)] for x in (train_nx, eval_nx, test_nx)]
             if cli.use_baed and cli.aug_gen != "baed":  # GGAD / AEGIS: fit on the current training set only
                 from baed.aug_generators import make_generator
