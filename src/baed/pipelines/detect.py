@@ -790,6 +790,7 @@ def run(argv=None):
                              f"and generated ego-graphs alike (node features become {AGG_DIM}-dim)")
     parser.add_argument("--data-tag", default="", help="ego-graph file suffix, e.g. _full -> <dataset>_full_init_0_1_dataset.pkl")
     parser.add_argument("--out", default=None, help="write metrics as JSON here")
+    parser.add_argument("--weight-suffix", default="", help="appended to the detector weight-file name (outputs/detect_weights)")
     cli = parser.parse_args(argv)
     global KEEP_ISOLATED, AGG_MODE, GEN_CHUNK, CENTER_FILL, GEN_HOPS, GEN_MAX_TRIES
     CENTER_FILL, GEN_HOPS, GEN_MAX_TRIES = cli.gen_center_fill, cli.gen_ego_hops, cli.gen_max_tries
@@ -843,6 +844,7 @@ def run(argv=None):
     # learning rate and ego-graph data in the weight-file name: parallel runs that differ only in these would
     # otherwise write (and test from) the same .pth file
     tag += (f"_lr{cli.lr:g}" if cli.lr != 1e-3 else "") + (cli.data_tag if cli.data_tag not in ("", "_full") else "")
+    tag += cli.weight_suffix  # e.g. the diffusion variant, so runs that differ only in the generator do not collide
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
