@@ -22,6 +22,8 @@ def add_model_args(parser):
     parser.add_argument('--arch', type=str, help='GAT | TGNN')
     parser.add_argument('--noise_schedule', type=str, default='cosine', help='cosine | linear')
     parser.add_argument('--norm', type=str, default='None', help='None | BN' )
+    parser.add_argument('--center_flag', type=eval, default=False,
+                        help='TGNN_gin_guided: give the denoiser a learned "node 0 is the ego-graph center" input')
     
 def _encoder_out_dim(guidance_encoder):
     """Output size of a GAE checkpoint's encoder (the last layer that declares one)."""
@@ -107,6 +109,7 @@ def get_model(args, initial_graph_sampler):
             return_node_class = args.has_node_feature,
             guidance_dim=embedding_dim if args.arch == 'TGNN_degree_embedding_guided' else 0,
             guidance_encoder=getattr(args, 'guidance_encoder', None),
+            center_flag=bool(getattr(args, 'center_flag', False)),  # runs trained before the flag existed: False
     )
 
     if args.noise_schedule == 'cosine':

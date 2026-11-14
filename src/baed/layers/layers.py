@@ -691,10 +691,15 @@ class TGNN_gin_guided(torch.nn.Module):
     edge (u, v) of the graph, from the symmetric pair feature [z_u + z_v, z_u * z_v].
     The released ``TGNN_embedding_guided`` pooled over the whole batch and mapped node ids modulo
     256; here every pooling is per graph.
+
+    center_flag=True adds a learned embedding of "is this node the ego-graph center" (node 0 of every graph) to the
+    node input. Without it the denoiser is permutation equivariant and cannot know which node is the center, so
+    for star-shaped ego-graphs (Reddit: center linked to every node, no other edge) it builds the star around a
+    random node, while the detector reads node 0 as the center.
     """
 
     def __init__(self, max_degree, num_node_classes, num_edge_classes, dim, num_steps, num_heads=[4, 4, 4, 1],
-                 dropout=0., norm='None', guidance_encoder=None, embedding_dim=256, **kwargs) -> None:
+                 dropout=0., norm='None', guidance_encoder=None, embedding_dim=256, center_flag=False, **kwargs) -> None:
         super().__init__()
         assert guidance_encoder, "TGNN_gin_guided needs --guidance_encoder (weights/gae/<file>)"
         enc = torch.load(str(paths.gae_weight(guidance_encoder)), map_location="cpu", weights_only=False)
@@ -710,7 +715,12 @@ class TGNN_gin_guided(torch.nn.Module):
         self.deg_in = torch.nn.Linear(1, dim)
         self.et_in = torch.nn.Linear(embedding_dim, dim)
         self.hg_in = torch.nn.Sequential(torch.nn.Linear(embedding_dim, dim), torch.nn.SiLU(), torch.nn.Linear(dim, dim))
-        self.node_in = torch.nn.Sequential(torch.nn.Linear(dim * 4, dim), torch.nn.SiLU())
+        self.center_flag = center_flag
+        n_in = 4
+        if center_flag:
+            self.center_in = torch.nn.Embedding(2, dim)
+            n_in = 5
+        self.node_in = torch.nn.Sequential(torch.nn.Linear(dim * n_in, dim), torch.nn.SiLU())
         self.time_pos_emb = SinusoidalPosEmb(dim, num_steps=num_steps)
         self.mlp = torch.nn.Sequential(torch.nn.Linear(dim, dim * 4), torch.nn.SiLU(), torch.nn.Linear(dim * 4, dim))
         self.global_mlp = torch.nn.Sequential(torch.nn.Linear(dim, dim * 4), torch.nn.SiLU(), torch.nn.Linear(dim * 4, dim))
@@ -723,9 +733,23 @@ class TGNN_gin_guided(torch.nn.Module):
             self.layers[f'conv{i}'] = pyg.nn.TransformerConv(in_channels=dim * 2, out_channels=dim, heads=num_head, concat=False)
             self.layers[f'norm{i}'] = norm_dict[norm](dim)
             self.layers[f'act{i}'] = torch.nn.SiLU()
-        self.node_out = torch.nn.Sequential(torch.nn.Linear(dim * 5, dim * 2), torch.nn.SiLU(), torch.nn.Linear(dim * 2, dim))
+        self.node_out = torch.nn.Sequential(torch.nn.Linear(dim * (n_in + 1), dim * 2), torch.nn.SiLU(), torch.nn.Linear(dim * 2, dim))
         self.final_out = torch.nn.Sequential(torch.nn.Linear(dim * 2, dim * 2), torch.nn.SiLU(),
                                              torch.nn.Linear(dim * 2, dim), torch.nn.SiLU(), torch.nn.Linear(dim, self.num_classes))
+
+    @staticmethod
+    def _is_center(batch):
+        """True for the first node of every graph of the batch (node 0 = the ego-graph center). Fixed shape, no
+        host sync, so it also runs inside the CUDA-graph sampling step."""
+        first = torch.ones_like(batch, dtype=torch.bool)
+        first[1:] = batch[1:] != batch[:-1]
+        return first
+
+    def _node_feats(self, z_t, deg, e_t, h_g, batch):
+        feats = [self.z_in(z_t), self.deg_in(deg), self.et_in(e_t)[batch], self.hg_in(h_g)[batch]]
+        if self.center_flag:
+            feats.append(self.center_in(self._is_center(batch).long()))
+        return feats
 
     @torch.no_grad()
     def _encode(self, x, edge_index):
@@ -766,7 +790,7 @@ class TGNN_gin_guided(torch.nn.Module):
             h_g = torch_scatter.scatter(pyg_data.embedding.detach().float(), batch, dim=0, dim_size=b, reduce='max')
         deg = pyg.utils.degree(edge_index[0], num_nodes=n).clamp(max=self.max_degree + 1)[:, None] / self.max_degree
 
-        node_feats = [self.z_in(z_t), self.deg_in(deg), self.et_in(e_t)[batch], self.hg_in(h_g)[batch]]
+        node_feats = self._node_feats(z_t, deg, e_t, h_g, batch)
         h = self.node_in(torch.cat(node_feats, dim=-1))
         t = self.mlp(self.time_pos_emb(t_node))
         state = h.unsqueeze(0)
@@ -854,7 +878,7 @@ class TGNN_gin_guided(torch.nn.Module):
         deg = _seg_sum(mf, src, n)
         deg = deg.clamp(max=self.max_degree + 1)[:, None] / self.max_degree
 
-        node_feats = [self.z_in(z_t), self.deg_in(deg), self.et_in(e_t)[batch], self.hg_in(h_g)[batch]]
+        node_feats = self._node_feats(z_t, deg, e_t, h_g, batch)
         h = self.node_in(torch.cat(node_feats, dim=-1))
         # sampling: every node of the batch is at the same step t, so the time embedding is computed on one row and
         # broadcast (it is a row-wise function of t)
