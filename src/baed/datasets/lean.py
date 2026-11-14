@@ -42,6 +42,10 @@ def load_lean(pkl_path: str | os.PathLike, load_nx, cache_dir: str | os.PathLike
     ``load_nx`` is called only on a cache miss (the networkx pickle is large and slow to load).
     """
     pkl_path = Path(pkl_path)
+    direct = Path(cache_dir) / f"{pkl_path.stem}.lean.pt"  # written by baed-build-subgraphs --lean-only (no pickle)
+    if not pkl_path.exists() and direct.exists():
+        logger.info(f"lean file (built without networkx): {direct}")
+        return torch.load(direct)
     cache = Path(cache_dir) / f"{pkl_path.stem}.lean.{int(pkl_path.stat().st_mtime)}.pt"
     if cache.exists():
         logger.info(f"lean cache hit: {cache}")

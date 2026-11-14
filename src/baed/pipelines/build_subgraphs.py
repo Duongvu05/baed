@@ -189,6 +189,36 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
     raise ValueError(f"unsupported dataset: {dataset}")
 
 
+def build_lean_only(dataset: str, label_type: str, backend: str = "auto", drop_unlabelled: bool = False,
+                    node_time: bool = False, hops: int | None = None, bidirectional: bool = False) -> None:
+    """Write the detector's lean tensors (data/cache/<name>.lean.pt) directly, without the networkx pickle.
+    Same ego-graphs, order and file name stem as initOriginDataset; datasets loaded as one static graph only."""
+    from baed.graph_ops import build_ego_lean
+    if dataset not in FULL_GRAPH_HOPS:
+        raise ValueError(f"--lean-only supports {sorted(FULL_GRAPH_HOPS)}, not {dataset}")
+    t0 = time.time()
+    graph, labels = load_full_graph(dataset)
+    if drop_unlabelled:
+        graph, labels = labelled_subgraph(graph, labels)
+    src, dst = graph.edges()
+    items = build_ego_lean(src.numpy(), dst.numpy(), graph.num_nodes(), graph.ndata["feature"],
+                           select_centers(labels, label_type), hops or FULL_GRAPH_HOPS[dataset], labels,
+                           max_nodes=1200 if dataset == "tfinance" else None, backend=backend,
+                           bidirectional=bidirectional)
+    if node_time:
+        t = np.load(paths.graph_file(f"{dataset}_node_time.npy"))
+        centers = [int(c) for c in select_centers(labels, label_type)]
+        items = [it for _, it in sorted(zip((t[c] for c in centers), items), key=lambda p: p[0])]
+    tag = ("_lab" if drop_unlabelled else "") + ("_t" if node_time else "") + ("_bi" if bidirectional else "")
+    tag += f"_h{hops}" if hops else ""
+    stem = output_file(dataset, label_type, tag=tag).stem
+    out = paths.ensure(paths.root() / "data" / "cache" / f"{stem}.lean.pt")
+    torch.save(items, out)
+    sizes = np.array([it[0].shape[0] for it in items])
+    logger.info(f"saved {len(items)} lean ego-graphs to {out} (nodes mean {sizes.mean():.1f}, max {sizes.max()}; "
+                f"{time.time() - t0:.1f}s)")
+
+
 def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
                       bidirectional: bool = False, drop_unlabelled: bool = False, node_time: bool = False,
                       hops: int | None = None) -> None:
@@ -229,9 +259,16 @@ def main(argv=None):
     parser.add_argument("--hops", type=int, default=None,
                         help="ego-graph radius instead of the released one (Elliptic and DGraph 2, Reddit, Photo, "
                              "T-Finance and Amazon 1); adds _h<hops> to the file name")
+    parser.add_argument("--lean-only", action="store_true",
+                        help="write only the detector's lean tensors (data/cache/<name>.lean.pt), no networkx pickle "
+                             "(minutes instead of hours for large ego-graphs; the diffusion still needs the pickle)")
     args = parser.parse_args(argv)
     for dataset in args.dataset:
         for label_type in args.label_type:
+            if args.lean_only:
+                build_lean_only(dataset, label_type, backend=args.backend, drop_unlabelled=args.drop_unlabelled,
+                                node_time=args.node_time, hops=args.hops, bidirectional=args.bidirectional)
+                continue
             initOriginDataset(dataset, label_type, backend=args.backend,
                               elliptic_full=args.elliptic_full and dataset == "elliptic",
                               bidirectional=args.bidirectional,

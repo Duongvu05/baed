@@ -162,3 +162,50 @@ def build_ego_graphs(
         g.graph["sublabel"] = int(center_labels[int(c)].item())
         graphs.append(g)
     return graphs
+
+
+def build_ego_lean(
+    src,
+    dst,
+    num_nodes: int,
+    features: torch.Tensor,
+    centers: Sequence[int],
+    hops: int,
+    center_labels: torch.Tensor,
+    max_nodes: int | None = None,
+    backend: str = "auto",
+    bidirectional: bool = False,
+) -> list[tuple[torch.Tensor, torch.Tensor, int]]:
+    """Same ego-graphs as ``build_ego_graphs`` but directly in the lean format of ``datasets.lean.convert``
+    (features, edge_index with both directions of every undirected edge and a self-loop once, center label),
+    without building networkx graphs. Node order is the same (center first, then the BFS nodes by id); the order
+    of the edges inside edge_index can differ, which does not change any GNN output beyond float rounding.
+    For large ego-graphs (2-hop Reddit: 21 M nodes in total) this takes minutes instead of hours."""
+    src, dst = np.asarray(src), np.asarray(dst)
+    if bidirectional:
+        src, dst = np.concatenate([src, dst]), np.concatenate([dst, src])
+    indptr, indices = to_csr(src, dst, num_nodes)
+    centers = np.asarray(list(centers), dtype=np.int64)
+    logger.info(f"lean ego-graphs: {len(centers)} centers, {hops} hop(s), "
+                f"{'both directions' if bidirectional else 'out-edges'}")
+    kept, node_ptr, nodes, edge_ptr, edges = ego_subgraphs(indptr, indices, centers, hops, max_nodes, backend)
+    edges = edges.reshape(-1, 2)
+    if (~kept).any():
+        logger.info(f"skipped {(~kept).sum()} ego-graphs larger than {max_nodes} nodes")
+    pos = np.full(num_nodes, -1, dtype=np.int64)  # global id -> local index, reset after every graph
+    items = []
+    for j, c in enumerate(centers[kept]):
+        nd = nodes[node_ptr[j]: node_ptr[j + 1]]
+        nd = np.concatenate([[c], nd[nd != c]]).astype(np.int64)
+        pos[nd] = np.arange(len(nd))
+        ed = edges[edge_ptr[j]: edge_ptr[j + 1]]
+        a, b = pos[ed[:, 0]], pos[ed[:, 1]]
+        lo, hi = np.minimum(a, b), np.maximum(a, b)
+        pair = np.unique(lo * len(nd) + hi)  # undirected, deduplicated (nx.Graph semantics)
+        lo, hi = pair // len(nd), pair % len(nd)
+        loop = lo == hi
+        s = np.concatenate([lo, hi[~loop]]); d = np.concatenate([hi, lo[~loop]])
+        ei = torch.from_numpy(np.stack([s, d])) if len(s) else torch.zeros((2, 0), dtype=torch.long)
+        items.append((features[torch.from_numpy(nd)].clone(), ei, int(center_labels[int(c)].item())))
+        pos[nd] = -1
+    return items
