@@ -148,14 +148,14 @@ def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto"
 
 
 def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
-          bidirectional: bool = False, drop_unlabelled: bool = False) -> list[nx.Graph]:
+          bidirectional: bool = False, drop_unlabelled: bool = False, hops: int | None = None) -> list[nx.Graph]:
     logger.info(f"dataset={dataset} label_type={label_type}")
 
     if dataset in FULL_GRAPH_HOPS:
         graph, labels = load_full_graph(dataset)
         if drop_unlabelled:
             graph, labels = labelled_subgraph(graph, labels)
-        return ego_from_dgl(graph, labels, label_type, hops=FULL_GRAPH_HOPS[dataset],
+        return ego_from_dgl(graph, labels, label_type, hops=hops or FULL_GRAPH_HOPS[dataset],
                             max_nodes=1200 if dataset == "tfinance" else None, backend=backend,
                             bidirectional=bidirectional)
 
@@ -182,18 +182,20 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
                 continue
             graph.ndata["feature"] = node_features
             graph.ndata["label"] = node_labels
-            nx_graphs += ego_from_dgl(graph, node_labels, label_type, hops=2, backend=backend, bidirectional=bidirectional)
+            nx_graphs += ego_from_dgl(graph, node_labels, label_type, hops=hops or 2, backend=backend,
+                                      bidirectional=bidirectional)
         return nx_graphs
 
     raise ValueError(f"unsupported dataset: {dataset}")
 
 
 def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
-                      bidirectional: bool = False, drop_unlabelled: bool = False, node_time: bool = False) -> None:
+                      bidirectional: bool = False, drop_unlabelled: bool = False, node_time: bool = False,
+                      hops: int | None = None) -> None:
     """Build and save one ego-graph dataset (name kept from the original code)."""
     t0 = time.time()
     nx_graphs = build(dataset, label_type, backend=backend, elliptic_full=elliptic_full, bidirectional=bidirectional,
-                      drop_unlabelled=drop_unlabelled)
+                      drop_unlabelled=drop_unlabelled, hops=hops)
     if node_time:
         # order the ego-graphs by the appearance time of their center (stable), so the sequential 70/15/15 split
         # of the detector is a temporal split, as on Elliptic
@@ -201,6 +203,7 @@ def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elli
         nx_graphs = [g for _, g in sorted(((t[next(iter(g.nodes))], g) for g in nx_graphs), key=lambda p: p[0])]
         logger.info(f"ego-graphs ordered by center time ({dataset}_node_time.npy)")
     tag = ("_full" if elliptic_full else "") + ("_lab" if drop_unlabelled else "") + ("_t" if node_time else "") + ("_bi" if bidirectional else "")
+    tag += f"_h{hops}" if hops else ""
     out = output_file(dataset, label_type, tag=tag)
     with open(out, "wb") as f:
         pkl.dump(nx_graphs, f)
@@ -223,6 +226,9 @@ def main(argv=None):
                              "so the sequential split is temporal; adds _t to the file name")
     parser.add_argument("--bidirectional", action="store_true",
                         help="ego-graphs over in- and out-edges (original: out-edges only); adds _bi to the file name")
+    parser.add_argument("--hops", type=int, default=None,
+                        help="ego-graph radius instead of the released one (Elliptic and DGraph 2, Reddit, Photo, "
+                             "T-Finance and Amazon 1); adds _h<hops> to the file name")
     args = parser.parse_args(argv)
     for dataset in args.dataset:
         for label_type in args.label_type:
@@ -230,7 +236,7 @@ def main(argv=None):
                               elliptic_full=args.elliptic_full and dataset == "elliptic",
                               bidirectional=args.bidirectional,
                               drop_unlabelled=args.drop_unlabelled and dataset != "elliptic",
-                              node_time=args.node_time and dataset != "elliptic")
+                              node_time=args.node_time and dataset != "elliptic", hops=args.hops)
 
 
 if __name__ == "__main__":
