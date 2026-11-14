@@ -516,11 +516,11 @@ def _current_losses(detector, feats, edges, labels):
 
 
 @torch.no_grad()
-def test_batched(detector, test_loader, model_path):
-    detector.load_state_dict(torch.load(model_path, map_location=device))
+def _probs(detector, loader):
+    """Labels and P(anomaly) of every graph of the loader (detector in eval mode)."""
     detector.eval()
     ys, probs = [], []
-    for data in test_loader:
+    for data in loader:
         if not data:
             continue
         bg, y, _ = _batch(data.subFeature, data.sub_edge_index, data.sub_label)
@@ -529,9 +529,26 @@ def test_batched(detector, test_loader, model_path):
         out = detector(bg).reshape(-1, 2)
         probs.append(F.softmax(out, dim=1)[:, 1].cpu())
         ys.append(y.cpu())
-    y = torch.cat(ys).numpy()
-    prob = torch.cat(probs).numpy()
-    pred = (prob > 0.5).astype(int)  # == argmax of a 2-class softmax
+    return torch.cat(ys).numpy(), torch.cat(probs).numpy()
+
+
+def val_threshold(y, prob):
+    """Decision threshold that maximises the macro F1 on the validation graphs (midpoints between the sorted
+    distinct scores, plus one below the lowest)."""
+    u = np.unique(prob)
+    cand = np.concatenate([[u[0] - 1e-12], (u[:-1] + u[1:]) / 2]) if len(u) > 1 else u - 1e-12
+    f1s = [f1_score(y, prob > t, average='macro') for t in cand]
+    return float(cand[int(np.argmax(f1s))])
+
+
+SELECT = "train_loss"  # set by --select: which epoch is kept (released code: lowest training loss)
+
+
+@torch.no_grad()
+def test_batched(detector, test_loader, model_path, thr=0.5):
+    detector.load_state_dict(torch.load(model_path, map_location=device))
+    y, prob = _probs(detector, test_loader)
+    pred = (prob > thr).astype(int)  # thr 0.5 == argmax of a 2-class softmax (released code)
     m = {'accuracy': float((pred == y).mean()), 'n_test': int(len(y)), 'n_test_anomaly': int(y.sum())}
     if len(np.unique(y)) > 1:
         m.update(auroc=float(roc_auc_score(y, prob)), auprc=float(average_precision_score(y, prob)),
@@ -645,7 +662,7 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
                   use_baed, withcondition, run_tag, eval_loader=None):
     model_path = str(paths.ensure(paths.root() / "outputs" / "detect_weights" /
                                   f"{dataset}_{detector.modelName}_{'BAED' if use_baed else 'None'}_{run_tag}.pth"))
-    best = float('inf')
+    best, best_epoch = float('inf'), 0
     for epoch in range(num_epochs):
         AUG["progress"] = (epoch + 1) / num_epochs
         detector.train()
@@ -666,10 +683,18 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
             tot += float(loss_each.sum())
             cnt += len(pos)
         avg = tot / max(cnt, 1)
-        if avg < best:
-            best = avg
+        if SELECT == "train_loss" or eval_loader is None:
+            score = avg
+        else:  # lower is better: negate the validation metric
+            with torch.no_grad():
+                yv, pv = _probs(detector, eval_loader)
+            score = -{"val_auroc": lambda: roc_auc_score(yv, pv), "val_auprc": lambda: average_precision_score(yv, pv),
+                      "val_f1": lambda: f1_score(yv, pv > 0.5, average='macro')}[SELECT]()
+        if score < best:
+            best, best_epoch = score, epoch + 1
             torch.save(detector.state_dict(), model_path)
-        print(f"Epoch {epoch + 1}: Average Error = {avg}")
+        print(f"Epoch {epoch + 1}: Average Error = {avg}" + ("" if SELECT == "train_loss" or eval_loader is None
+                                                             else f" | {SELECT} {-score:.4f}"))
         if use_baed:
             fr = STATS["real_fraud"] + STATS["syn_valid"]
             print(f"  loss batches: normal {STATS['real_normal']} | fraud {fr} (real {STATS['real_fraud']}, synthetic "
@@ -678,9 +703,19 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
                   + (f" | center-fill: {STATS['gen_rounds']} diffusion calls, {STATS['resampled']} isolated-center "
                      f"resamples, {STATS['template_replaced']} templates replaced" if CENTER_FILL else ""))
     m = test_batched(detector, test_loader, model_path)
+    m.update(select=SELECT, best_epoch=best_epoch)
     if eval_loader is not None:
         v = test_batched(detector, eval_loader, model_path)
-        m.update({f"val_{k}": v[k] for k in ("auroc", "auprc", "f1_macro") if k in v})
+        m.update({f"val_{k}": v[k] for k in ("auroc", "auprc", "f1_macro", "f1_anomaly") if k in v})
+        # threshold chosen on the validation set (macro F1), applied to the test set; the keys above stay argmax
+        with torch.no_grad():
+            yv, pv = _probs(detector, eval_loader)
+        thr = val_threshold(yv, pv)
+        t = test_batched(detector, test_loader, model_path, thr=thr)
+        m.update(val_threshold=thr, thr_f1_macro=t.get("f1_macro"), thr_f1_anomaly=t.get("f1_anomaly"),
+                 thr_val_f1_macro=float(f1_score(yv, pv > thr, average='macro')))
+        print(f"threshold chosen on val {thr:.4f}: test macro F1 {m['thr_f1_macro']:.4f}, F1 class 1 "
+              f"{m['thr_f1_anomaly']:.4f} | best epoch {best_epoch} ({SELECT})")
     return m
 
 
@@ -790,14 +825,19 @@ def run(argv=None):
                              f"and generated ego-graphs alike (node features become {AGG_DIM}-dim)")
     parser.add_argument("--data-tag", default="", help="ego-graph file suffix, e.g. _full -> <dataset>_full_init_0_1_dataset.pkl")
     parser.add_argument("--out", default=None, help="write metrics as JSON here")
+    parser.add_argument("--select", default="train_loss", choices=["train_loss", "val_auroc", "val_auprc", "val_f1"],
+                        help="(--batched) epoch kept for testing: lowest training loss (released code) or best "
+                             "validation AUROC / AUPRC / argmax macro F1. The test metrics are always also reported "
+                             "with a threshold chosen on the validation set (keys thr_*)")
     parser.add_argument("--lean", action="store_true",
                         help="per-sample (released) training read from the lean tensor cache instead of networkx "
                              "graphs + preprocessDataset: same features and edges, no 10 s per-graph timeout, much less "
                              "memory (needed for large ego-graphs, e.g. 2-hop Reddit)")
     parser.add_argument("--weight-suffix", default="", help="appended to the detector weight-file name (outputs/detect_weights)")
     cli = parser.parse_args(argv)
-    global KEEP_ISOLATED, AGG_MODE, GEN_CHUNK, CENTER_FILL, GEN_HOPS, GEN_MAX_TRIES
+    global KEEP_ISOLATED, AGG_MODE, GEN_CHUNK, CENTER_FILL, GEN_HOPS, GEN_MAX_TRIES, SELECT
     CENTER_FILL, GEN_HOPS, GEN_MAX_TRIES = cli.gen_center_fill, cli.gen_ego_hops, cli.gen_max_tries
+    SELECT = cli.select
     GEN_CHUNK = max(1, cli.gen_chunk)
     KEEP_ISOLATED = cli.keep_isolated
     AGG_MODE = cli.agg_features
@@ -848,7 +888,8 @@ def run(argv=None):
     # learning rate and ego-graph data in the weight-file name: parallel runs that differ only in these would
     # otherwise write (and test from) the same .pth file
     tag += (f"_lr{cli.lr:g}" if cli.lr != 1e-3 else "") + (cli.data_tag if cli.data_tag not in ("", "_full") else "")
-    tag += ("_lean" if cli.lean and not cli.batched else "") + cli.weight_suffix  # e.g. the diffusion variant, so runs that differ only in the generator do not collide
+    tag += ("_lean" if cli.lean and not cli.batched else "") + (f"_sel{cli.select}" if cli.select != "train_loss" else "")
+    tag += cli.weight_suffix  # e.g. the diffusion variant, so runs that differ only in the generator do not collide
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
