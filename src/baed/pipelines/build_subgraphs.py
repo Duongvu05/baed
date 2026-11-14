@@ -112,13 +112,22 @@ def labelled_subgraph(graph, labels):
     return sub, labels[keep]
 
 
-def select_centers(labels: torch.Tensor, label_type: str) -> list[int]:
+# Reddit: nodes 0..9,999 are users, 10,000..10,983 subreddits (JODIE mapping, scripts/make_node_time.py). Only users
+# carry a real label (banned or not); the .mat file gives every subreddit label 0, so the released code used the 984
+# subreddits as normal centers.
+USER_NODES = {"reddit": 10000}
+
+
+def select_centers(labels: torch.Tensor, label_type: str, below: int | None = None) -> list[int]:
+    """Labelled nodes used as ego-graph centers; ``below``: keep only node ids < below (Reddit users only)."""
     if label_type == "label_1":
         mask = labels == 1
     elif label_type == "label_0_1":
         mask = (labels == 0) | (labels == 1)
     else:
         raise ValueError("label_type must be 'label_1' or 'label_0_1'")
+    if below is not None:
+        mask = mask & (torch.arange(len(labels)) < below)
     return torch.nonzero(mask, as_tuple=True)[0].tolist()
 
 
@@ -127,11 +136,12 @@ def output_file(dataset: str, label_type: str, tag: str = ""):
     return paths.ensure(paths.graph_file(f"{dataset}{tag}_init_{suffix}_dataset.pkl"))
 
 
-def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto", bidirectional=False):
+def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto", bidirectional=False,
+                 centers_below=None):
     """``labels``: integer label per node, used to pick centers and for ``sublabel``.
     Node attributes are taken from ``graph.ndata['feature']`` / ``graph.ndata['label']``."""
     src, dst = graph.edges()
-    centers = select_centers(labels, label_type)
+    centers = select_centers(labels, label_type, below=centers_below)
     return build_ego_graphs(
         src.numpy(),
         dst.numpy(),
@@ -148,7 +158,8 @@ def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto"
 
 
 def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
-          bidirectional: bool = False, drop_unlabelled: bool = False, hops: int | None = None) -> list[nx.Graph]:
+          bidirectional: bool = False, drop_unlabelled: bool = False, hops: int | None = None,
+          users_only: bool = False) -> list[nx.Graph]:
     logger.info(f"dataset={dataset} label_type={label_type}")
 
     if dataset in FULL_GRAPH_HOPS:
@@ -157,7 +168,7 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
             graph, labels = labelled_subgraph(graph, labels)
         return ego_from_dgl(graph, labels, label_type, hops=hops or FULL_GRAPH_HOPS[dataset],
                             max_nodes=1200 if dataset == "tfinance" else None, backend=backend,
-                            bidirectional=bidirectional)
+                            bidirectional=bidirectional, centers_below=USER_NODES[dataset] if users_only else None)
 
     if dataset == "elliptic":
         nx_graphs = []
@@ -190,7 +201,8 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
 
 
 def build_lean_only(dataset: str, label_type: str, backend: str = "auto", drop_unlabelled: bool = False,
-                    node_time: bool = False, hops: int | None = None, bidirectional: bool = False) -> None:
+                    node_time: bool = False, hops: int | None = None, bidirectional: bool = False,
+                    users_only: bool = False) -> None:
     """Write the detector's lean tensors (data/cache/<name>.lean.pt) directly, without the networkx pickle.
     Same ego-graphs, order and file name stem as initOriginDataset; datasets loaded as one static graph only."""
     from baed.graph_ops import build_ego_lean
@@ -201,16 +213,17 @@ def build_lean_only(dataset: str, label_type: str, backend: str = "auto", drop_u
     if drop_unlabelled:
         graph, labels = labelled_subgraph(graph, labels)
     src, dst = graph.edges()
+    below = USER_NODES[dataset] if users_only else None
     items = build_ego_lean(src.numpy(), dst.numpy(), graph.num_nodes(), graph.ndata["feature"],
-                           select_centers(labels, label_type), hops or FULL_GRAPH_HOPS[dataset], labels,
+                           select_centers(labels, label_type, below), hops or FULL_GRAPH_HOPS[dataset], labels,
                            max_nodes=1200 if dataset == "tfinance" else None, backend=backend,
                            bidirectional=bidirectional)
     if node_time:
         t = np.load(paths.graph_file(f"{dataset}_node_time.npy"))
-        centers = [int(c) for c in select_centers(labels, label_type)]
+        centers = [int(c) for c in select_centers(labels, label_type, below)]
         items = [it for _, it in sorted(zip((t[c] for c in centers), items), key=lambda p: p[0])]
     tag = ("_lab" if drop_unlabelled else "") + ("_t" if node_time else "") + ("_bi" if bidirectional else "")
-    tag += f"_h{hops}" if hops else ""
+    tag += (f"_h{hops}" if hops else "") + ("_u" if users_only else "")
     stem = output_file(dataset, label_type, tag=tag).stem
     out = paths.ensure(paths.root() / "data" / "cache" / f"{stem}.lean.pt")
     torch.save(items, out)
@@ -221,11 +234,11 @@ def build_lean_only(dataset: str, label_type: str, backend: str = "auto", drop_u
 
 def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
                       bidirectional: bool = False, drop_unlabelled: bool = False, node_time: bool = False,
-                      hops: int | None = None) -> None:
+                      hops: int | None = None, users_only: bool = False) -> None:
     """Build and save one ego-graph dataset (name kept from the original code)."""
     t0 = time.time()
     nx_graphs = build(dataset, label_type, backend=backend, elliptic_full=elliptic_full, bidirectional=bidirectional,
-                      drop_unlabelled=drop_unlabelled, hops=hops)
+                      drop_unlabelled=drop_unlabelled, hops=hops, users_only=users_only)
     if node_time:
         # order the ego-graphs by the appearance time of their center (stable), so the sequential 70/15/15 split
         # of the detector is a temporal split, as on Elliptic
@@ -233,7 +246,7 @@ def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elli
         nx_graphs = [g for _, g in sorted(((t[next(iter(g.nodes))], g) for g in nx_graphs), key=lambda p: p[0])]
         logger.info(f"ego-graphs ordered by center time ({dataset}_node_time.npy)")
     tag = ("_full" if elliptic_full else "") + ("_lab" if drop_unlabelled else "") + ("_t" if node_time else "") + ("_bi" if bidirectional else "")
-    tag += f"_h{hops}" if hops else ""
+    tag += (f"_h{hops}" if hops else "") + ("_u" if users_only else "")
     out = output_file(dataset, label_type, tag=tag)
     with open(out, "wb") as f:
         pkl.dump(nx_graphs, f)
@@ -259,6 +272,9 @@ def main(argv=None):
     parser.add_argument("--hops", type=int, default=None,
                         help="ego-graph radius instead of the released one (Elliptic and DGraph 2, Reddit, Photo, "
                              "T-Finance and Amazon 1); adds _h<hops> to the file name")
+    parser.add_argument("--users-only", action="store_true",
+                        help="Reddit: only users are ego-graph centers (subreddits stay as neighbours; their label 0 in "
+                             "the .mat file is not a real label); adds _u to the file name")
     parser.add_argument("--lean-only", action="store_true",
                         help="write only the detector's lean tensors (data/cache/<name>.lean.pt), no networkx pickle "
                              "(minutes instead of hours for large ego-graphs; the diffusion still needs the pickle)")
@@ -267,13 +283,15 @@ def main(argv=None):
         for label_type in args.label_type:
             if args.lean_only:
                 build_lean_only(dataset, label_type, backend=args.backend, drop_unlabelled=args.drop_unlabelled,
-                                node_time=args.node_time, hops=args.hops, bidirectional=args.bidirectional)
+                                node_time=args.node_time, hops=args.hops, bidirectional=args.bidirectional,
+                                users_only=args.users_only and dataset in USER_NODES)
                 continue
             initOriginDataset(dataset, label_type, backend=args.backend,
                               elliptic_full=args.elliptic_full and dataset == "elliptic",
                               bidirectional=args.bidirectional,
                               drop_unlabelled=args.drop_unlabelled and dataset != "elliptic",
-                              node_time=args.node_time and dataset != "elliptic", hops=args.hops)
+                              node_time=args.node_time and dataset != "elliptic", hops=args.hops,
+                              users_only=args.users_only and dataset in USER_NODES)
 
 
 if __name__ == "__main__":
