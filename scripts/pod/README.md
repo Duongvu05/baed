@@ -11,6 +11,8 @@ single-node ego-graphs dropped.
 | `reddit_u_valsel.sh` | Reddit | users only as centers (`_u`), 1 hop; base and +BAED (center-flag diffusion) at lr 1e-3 and 1e-6 |
 | `photo_valsel_base.sh` | Photo | every node, 1 hop (released code); base only |
 | `tfinance_valsel_base.sh` | T-Finance | every node, 1 hop, ego-graphs > 1200 nodes dropped (released code); base only |
+| `dgraph_t_valsel_base.sh` | DGraph-Fin | as `dgraph_valsel_base.sh`, sorted by each center's first edge day (temporal split, tag `_t`); base only |
+| `seeds_base.sh` | any | extra seeds 42, 63, 87, 94 of the base, run in parallel |
 | `dgraph_valsel_base.sh` | DGraph-Fin | nodes labelled 0/1 as centers, 2 hops along out-edges, background nodes 2/3 kept as neighbours (released code); base only |
 
 The base runs pass a `--gae-weight` file only because `baed-detect` always loads one. The base does not use it.

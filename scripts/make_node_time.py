@@ -1,11 +1,16 @@
 """Per-node appearance time for datasets whose GAD release dropped the timestamps.
 
     uv run python scripts/make_node_time.py reddit <path to JODIE reddit.csv>
+    uv run python scripts/make_node_time.py dgraph
 
 Reddit: data/graphs/reddit.mat is the JODIE Reddit network (snap.stanford.edu/jodie/reddit.csv): node u is
 user u (0..9,999) and node 10,000 + i is subreddit i (0..983); its 78,516 edges and 366 anomalies (banned
 users) are exactly JODIE's unique user-subreddit pairs and banned users. A node's time is its first interaction,
 the analogue of the Elliptic timestep. Writes data/graphs/reddit_node_time.npy (float, seconds).
+
+DGraph-Fin: dgraphfin.npz keeps edge_timestamp (days 1..821) but has no node time, and its node ids do not follow
+time (Spearman 0.15 with the first edge day on labelled nodes). A node's time is the day of its first edge (in or
+out). Every node labelled 0/1 has at least one edge. Writes data/graphs/dgraph_node_time.npy (float, days).
 """
 import sys
 
@@ -16,9 +21,25 @@ import scipy.io as sio
 from baed import paths
 
 
+def dgraph():
+    d = np.load(paths.graph_file("dgraphfin.npz"))
+    e, ts = d["edge_index"], d["edge_timestamp"].astype(float)
+    t = np.full(len(d["y"]), np.inf)
+    np.minimum.at(t, e[:, 0], ts)
+    np.minimum.at(t, e[:, 1], ts)
+    lab = (d["y"] == 0) | (d["y"] == 1)
+    assert np.isfinite(t[lab]).all(), "a labelled node has no edge"
+    out = paths.graph_file("dgraph_node_time.npy")
+    np.save(out, t)
+    print(f"{out}: {len(t)} nodes, labelled first edge day {t[lab].min():.0f}..{t[lab].max():.0f}, "
+          f"{int((~np.isfinite(t)).sum())} nodes without edges (inf)")
+
+
 def main():
+    if sys.argv[1] == "dgraph":
+        return dgraph()
     dataset, csv = sys.argv[1], sys.argv[2]
-    assert dataset == "reddit", "only reddit is implemented"
+    assert dataset == "reddit", "only reddit and dgraph are implemented"
     df = pd.read_csv(csv, usecols=[0, 1, 2], header=None, skiprows=1, names=["user", "item", "ts"])
     n_users = int(df.user.max()) + 1
     n = int(sio.loadmat(str(paths.graph_file("reddit.mat")))["Network"].shape[0])
