@@ -541,12 +541,41 @@ def _probs(detector, loader):
     return torch.cat(ys).numpy(), torch.cat(probs).numpy()
 
 
+def _threshold_candidates(prob):
+    u = np.unique(prob)
+    return np.concatenate([[u[0] - 1e-12], (u[:-1] + u[1:]) / 2]) if len(u) > 1 else u - 1e-12
+
+
+def macro_f1_curve(y, prob, cand):
+    """Macro F1 of the predictions prob > t for every t in cand, in O(n log n): the counts come from one sort and
+    cumulative sums instead of one f1_score call per threshold (quadratic on 10^5 validation graphs). Same
+    values as sklearn's f1_score(average='macro') when y holds both classes (an empty class scores 0)."""
+    y = np.asarray(y).astype(bool)
+    prob = np.asarray(prob)
+    order = np.argsort(prob, kind="stable")
+    sp, sy = prob[order], y[order]
+    n, pos = len(y), int(y.sum())
+    neg = n - pos
+    below_pos = np.concatenate([[0], np.cumsum(sy)])  # positives among the k lowest scores
+    k = np.searchsorted(sp, cand, side="right")       # graphs with prob <= t, predicted normal
+    tp = pos - below_pos[k]
+    fp = (n - k) - tp
+    fn = pos - tp
+    tn = neg - fp
+    with np.errstate(divide="ignore", invalid="ignore"):
+        f1_pos = np.where(2 * tp + fp + fn > 0, 2 * tp / (2 * tp + fp + fn), 0.0)
+        f1_neg = np.where(2 * tn + fn + fp > 0, 2 * tn / (2 * tn + fn + fp), 0.0)
+    return (f1_pos + f1_neg) / 2
+
+
 def val_threshold(y, prob):
     """Decision threshold that maximises the macro F1 on the validation graphs (midpoints between the sorted
     distinct scores, plus one below the lowest)."""
-    u = np.unique(prob)
-    cand = np.concatenate([[u[0] - 1e-12], (u[:-1] + u[1:]) / 2]) if len(u) > 1 else u - 1e-12
-    f1s = [f1_score(y, prob > t, average='macro') for t in cand]
+    cand = _threshold_candidates(prob)
+    if len(np.unique(y)) < 2:  # sklearn semantics differ for a single class: keep the reference loop
+        f1s = [f1_score(y, prob > t, average='macro') for t in cand]
+    else:
+        f1s = macro_f1_curve(y, prob, cand)
     return float(cand[int(np.argmax(f1s))])
 
 
