@@ -15,6 +15,7 @@ single-node ego-graphs dropped.
 | `tfinance_t_base.sh` | T-Finance | as `tfinance_valsel_base.sh`, sorted by registration day (-feature 0, temporal split, tag `_t`); base, 5 seeds, `--gpu-store` |
 | `tfinance_nocap_base.sh` | T-Finance | without the 1200-node cap (`--no-cap`), id order and registration-day order; base, one seed |
 | `dgraph_base_bs.sh` | DGraph-Fin | base with `--batch-size 1024 --gpu-store`, id order and `_t` in parallel |
+| `dgraph_t_ec_base.sh` | DGraph-Fin | time order with no future edges (`--edge-cutoff`, tag `_t_ec`); base, batch 1024 |
 | `seeds_base.sh` | any | extra seeds 42, 63, 87, 94 of the base, run in parallel |
 | `dgraph_valsel_base.sh` | DGraph-Fin | nodes labelled 0/1 as centers, 2 hops along out-edges, background nodes 2/3 kept as neighbours (released code); base only |
 

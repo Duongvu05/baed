@@ -240,6 +240,57 @@ def build_lean_only(dataset: str, label_type: str, backend: str = "auto", drop_u
                 f"{time.time() - t0:.1f}s)")
 
 
+SPLIT = (0.7, 0.15)  # detect.split_dataset: train int(0.7 N), val int(0.15 N), test = val size, rest unused
+
+
+def build_lean_edge_cutoff(dataset: str, label_type: str, backend: str = "auto") -> None:
+    """DGraph in time order with no future edges (tag _t_ec). The centers are sorted by their node time
+    (<dataset>_node_time.npy, as --node-time), and cut into the detector's train / val / test segments
+    (detect.split_dataset). The cutoff of a segment is the time of its last center. The ego-graph of a center
+    uses only the edges whose timestamp is <= the cutoff of its segment, so no training or validation
+    ego-graph contains an edge from a later period (as on Elliptic, where every edge lies in its timestep).
+    The segments, and so the split, are the same as for --node-time; only the ego-graphs change."""
+    from baed.graph_ops import build_ego_lean
+    if dataset != "dgraph":
+        raise ValueError("--edge-cutoff needs edge timestamps: dgraph only")
+    t0 = time.time()
+    graph, labels = load_full_graph(dataset)
+    raw = np.load(paths.graph_file("dgraphfin.npz"))
+    rs, rd, rt = raw["edge_index"][:, 0], raw["edge_index"][:, 1], raw["edge_timestamp"]
+    keep = rs != rd  # load_full_graph removed the self-loops, in order
+    src, dst = (x.numpy() for x in graph.edges())
+    assert np.array_equal(src, rs[keep]) and np.array_equal(dst, rd[keep]), "edge order differs from dgraphfin.npz"
+    ts = rt[keep]
+    t = np.load(paths.graph_file(f"{dataset}_node_time.npy"))
+    centers = np.asarray(select_centers(labels, label_type), dtype=np.int64)
+    centers = centers[np.argsort(t[centers], kind="stable")]  # same order as --node-time (stable, ties by id)
+    n = len(centers)
+    a = int(SPLIT[0] * n)
+    b = a + int(SPLIT[1] * n)
+    c = b + int(SPLIT[1] * n)
+    bounds = [(0, a), (a, b), (b, c), (c, n)]
+    items = []
+    for k, (lo, hi) in enumerate(bounds):
+        if lo == hi:
+            continue
+        seg = centers[lo:hi]
+        cut = t[seg[-1]] if k < 3 else np.inf  # the few graphs after the test segment are never used
+        m = ts <= cut
+        logger.info(f"segment {k}: centers {lo}..{hi - 1}, node time {t[seg[0]]:.0f}..{t[seg[-1]]:.0f}, "
+                    f"edges <= {cut}: {int(m.sum())} of {len(m)}")
+        part, kept = build_ego_lean(src[m], dst[m], graph.num_nodes(), graph.ndata["feature"], seg.tolist(),
+                                    FULL_GRAPH_HOPS[dataset], labels, max_nodes=None, backend=backend,
+                                    return_centers=True)
+        assert np.array_equal(kept, seg)
+        items += part
+    stem = output_file(dataset, label_type, tag="_t_ec").stem
+    out = paths.ensure(paths.root() / "data" / "cache" / f"{stem}.lean.pt")
+    torch.save(items, out)
+    sizes = np.array([it[0].shape[0] for it in items])
+    logger.info(f"saved {len(items)} lean ego-graphs to {out} (nodes mean {sizes.mean():.1f}, max {sizes.max()}, "
+                f"single-node {(sizes == 1).sum()}; {time.time() - t0:.1f}s)")
+
+
 def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
                       bidirectional: bool = False, drop_unlabelled: bool = False, node_time: bool = False,
                       hops: int | None = None, users_only: bool = False, no_cap: bool = False) -> None:
@@ -289,9 +340,18 @@ def main(argv=None):
     parser.add_argument("--no-cap", action="store_true",
                         help="T-Finance: keep the ego-graphs larger than 1200 nodes that the released code drops; adds "
                              "_nocap to the file name")
+    parser.add_argument("--edge-cutoff", action="store_true",
+                        help="DGraph, with --lean-only --node-time: the ego-graphs of each train / val / test segment "
+                             "use only the edges up to the time of the segment's last center (no future edges); "
+                             "file tag _t_ec")
     args = parser.parse_args(argv)
+    if args.edge_cutoff and not (args.lean_only and args.node_time):
+        parser.error("--edge-cutoff requires --lean-only and --node-time")
     for dataset in args.dataset:
         for label_type in args.label_type:
+            if args.edge_cutoff:
+                build_lean_edge_cutoff(dataset, label_type, backend=args.backend)
+                continue
             if args.lean_only:
                 build_lean_only(dataset, label_type, backend=args.backend, drop_unlabelled=args.drop_unlabelled,
                                 node_time=args.node_time, hops=args.hops, bidirectional=args.bidirectional,
