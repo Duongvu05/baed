@@ -516,14 +516,23 @@ def _current_losses(detector, feats, edges, labels):
 
 
 @torch.no_grad()
+def _store_features():
+    """Feature function of GpuStore.batch: the same node features as _batch builds."""
+    return (lambda x, e, n: recompute_aggregates(x.float(), e, n)) if AGG_MODE == "recompute" else None
+
+
 def _probs(detector, loader):
     """Labels and P(anomaly) of every graph of the loader (detector in eval mode)."""
     detector.eval()
     ys, probs = [], []
+    store = getattr(loader, "store", None)
     for data in loader:
-        if not data:
+        if store is not None:  # --gpu-store: the loader yields item indices
+            bg, y, _ = store.batch(data, _store_features())
+        elif not data:
             continue
-        bg, y, _ = _batch(data.subFeature, data.sub_edge_index, data.sub_label)
+        else:
+            bg, y, _ = _batch(data.subFeature, data.sub_edge_index, data.sub_label)
         if bg is None:
             continue
         out = detector(bg).reshape(-1, 2)
@@ -669,9 +678,13 @@ def train_batched(detector, generator, gae, train_loader, test_loader, num_epoch
         tot, cnt = 0.0, 0
         STATS.update(real_normal=0, real_fraud=0, syn_requested=0, syn_valid=0, gen_rounds=0, resampled=0,
                      template_replaced=0)
-        for feats, edges, labels in _augmented_batches(train_loader, detector, generator, gae, epoch, use_baed,
-                                                       withcondition):
-            bg, y, pos = _batch(feats, edges, labels)
+        store = getattr(train_loader, "store", None)
+        if store is not None:  # --gpu-store (base only): batches gathered on the GPU from item indices
+            batches = (store.batch(idx, _store_features()) for idx in tqdm(train_loader, leave=False))
+        else:
+            batches = (_batch(feats, edges, labels) for feats, edges, labels in
+                       _augmented_batches(train_loader, detector, generator, gae, epoch, use_baed, withcondition))
+        for bg, y, pos in batches:
             if bg is None:
                 continue
             out = detector(bg).reshape(-1, 2)
@@ -833,6 +846,10 @@ def run(argv=None):
                         help="per-sample (released) training read from the lean tensor cache instead of networkx "
                              "graphs + preprocessDataset: same features and edges, no 10 s per-graph timeout, much less "
                              "memory (needed for large ego-graphs, e.g. 2-hop Reddit)")
+    parser.add_argument("--gpu-store", action="store_true",
+                        help="(--batched) keep each split on the GPU and gather mini-batches by index: same batches "
+                             "and results as the default loader, much faster for many small ego-graphs. The +BAED "
+                             "training batches keep the default loader (only validation and test use the store)")
     parser.add_argument("--weight-suffix", default="", help="appended to the detector weight-file name (outputs/detect_weights)")
     cli = parser.parse_args(argv)
     global KEEP_ISOLATED, AGG_MODE, GEN_CHUNK, CENTER_FILL, GEN_HOPS, GEN_MAX_TRIES, SELECT
@@ -846,6 +863,8 @@ def run(argv=None):
             parser.error("--agg-features recompute requires --batched")
         cli.node_feats = AGG_DIM  # detector input; the guidance encoder and generator keep the raw 166 features
     AUG.update(gen_noise=cli.gen_noise, curriculum=cli.curriculum, alpha=cli.cur_alpha, beta=cli.cur_beta)
+    if cli.gpu_store and not cli.batched:
+        parser.error("--gpu-store requires --batched")
     if cli.keep_isolated and not cli.batched:
         parser.error("--keep-isolated requires --batched")
     if cli.aug_gen != "baed" and not (cli.batched and cli.use_baed):
@@ -889,7 +908,7 @@ def run(argv=None):
     # otherwise write (and test from) the same .pth file
     tag += (f"_lr{cli.lr:g}" if cli.lr != 1e-3 else "") + (cli.data_tag if cli.data_tag not in ("", "_full") else "")
     tag += ("_lean" if cli.lean and not cli.batched else "") + (f"_sel{cli.select}" if cli.select != "train_loss" else "")
-    tag += cli.weight_suffix  # e.g. the diffusion variant, so runs that differ only in the generator do not collide
+    tag += ("_gs" if cli.gpu_store else "") + cli.weight_suffix  # e.g. the diffusion variant, so runs that differ only in the generator do not collide
     batch_size, num_workers, pin_memory = cli.batch_size, 0, True
     print("epoch:{};lr:{}".format(cli.epochs, cli.lr))
 
@@ -902,6 +921,21 @@ def run(argv=None):
                 generator = make_generator(cli.aug_gen, sets[0], seed=cli.seed, device=str(device))
                 set_seed(cli.seed)
             print("训练集/验证集/测试集样本数:", [len(x) for x in sets], "train anomalies:", sum(it[2] for it in sets[0]))
+            if cli.gpu_store and cli.batched:
+                from baed.datasets.gpu_store import GpuStore
+
+                dl = []
+                for k, x in enumerate(sets):
+                    if k == 0 and cli.use_baed:  # +BAED mixes synthetic graphs into the batch: default loader
+                        dl.append(DataLoader(x, batch_size=batch_size, shuffle=True, collate_fn=lean_collate))
+                        continue
+                    # a DataLoader over range(len(x)) draws the same permutation as one over x itself
+                    d = DataLoader(range(len(x)), batch_size=batch_size, shuffle=(k == 0))
+                    d.store = GpuStore(x, device, keep_isolated=cli.keep_isolated)
+                    dl.append(d)
+                print("gpu store:", [f"{d.store.size} graphs {d.store.nbytes() / 2**30:.2f} GiB" if hasattr(d, "store")
+                                     else "default loader" for d in dl])
+                return sets, dl
             dl = [DataLoader(x, batch_size=batch_size, shuffle=(k == 0), collate_fn=lean_collate) for k, x in enumerate(sets)]
             return sets, dl
         sets = [GraphDataset(preprocessDataset(x)) for x in (train_nx, eval_nx, test_nx)]
