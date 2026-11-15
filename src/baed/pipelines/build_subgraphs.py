@@ -214,14 +214,17 @@ def build_lean_only(dataset: str, label_type: str, backend: str = "auto", drop_u
         graph, labels = labelled_subgraph(graph, labels)
     src, dst = graph.edges()
     below = USER_NODES[dataset] if users_only else None
-    items = build_ego_lean(src.numpy(), dst.numpy(), graph.num_nodes(), graph.ndata["feature"],
-                           select_centers(labels, label_type, below), hops or FULL_GRAPH_HOPS[dataset], labels,
-                           max_nodes=1200 if dataset == "tfinance" else None, backend=backend,
-                           bidirectional=bidirectional)
+    items, centers = build_ego_lean(src.numpy(), dst.numpy(), graph.num_nodes(), graph.ndata["feature"],
+                                    select_centers(labels, label_type, below), hops or FULL_GRAPH_HOPS[dataset], labels,
+                                    max_nodes=1200 if dataset == "tfinance" else None, backend=backend,
+                                    bidirectional=bidirectional, return_centers=True)
     if node_time:
+        # centers of the KEPT ego-graphs (T-Finance drops those > 1200 nodes): pairing the items with all selected
+        # centers would shift the times after the first dropped graph
         t = np.load(paths.graph_file(f"{dataset}_node_time.npy"))
-        centers = [int(c) for c in select_centers(labels, label_type, below)]
-        items = [it for _, it in sorted(zip((t[c] for c in centers), items), key=lambda p: p[0])]
+        assert len(centers) == len(items)
+        order = sorted(range(len(items)), key=lambda i: t[int(centers[i])])  # stable: ties keep center order
+        items = [items[i] for i in order]
     tag = ("_lab" if drop_unlabelled else "") + ("_t" if node_time else "") + ("_bi" if bidirectional else "")
     tag += (f"_h{hops}" if hops else "") + ("_u" if users_only else "")
     stem = output_file(dataset, label_type, tag=tag).stem

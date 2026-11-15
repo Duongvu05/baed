@@ -175,12 +175,15 @@ def build_ego_lean(
     max_nodes: int | None = None,
     backend: str = "auto",
     bidirectional: bool = False,
-) -> list[tuple[torch.Tensor, torch.Tensor, int]]:
+    return_centers: bool = False,
+):
     """Same ego-graphs as ``build_ego_graphs`` but directly in the lean format of ``datasets.lean.convert``
     (features, edge_index with both directions of every undirected edge and a self-loop once, center label),
     without building networkx graphs. Node order is the same (center first, then the BFS nodes by id); the order
     of the edges inside edge_index can differ, which does not change any GNN output beyond float rounding.
-    For large ego-graphs (2-hop Reddit: 21 M nodes in total) this takes minutes instead of hours."""
+    For large ego-graphs (2-hop Reddit: 21 M nodes in total) this takes minutes instead of hours.
+    Returns the list of items, or (items, kept centers) with ``return_centers``: the centers of the items in the
+    same order, without those skipped by ``max_nodes``."""
     src, dst = np.asarray(src), np.asarray(dst)
     if bidirectional:
         src, dst = np.concatenate([src, dst]), np.concatenate([dst, src])
@@ -208,4 +211,4 @@ def build_ego_lean(
         ei = torch.from_numpy(np.stack([s, d])) if len(s) else torch.zeros((2, 0), dtype=torch.long)
         items.append((features[torch.from_numpy(nd)].clone(), ei, int(center_labels[int(c)].item())))
         pos[nd] = -1
-    return items
+    return (items, centers[kept]) if return_centers else items
