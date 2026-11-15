@@ -157,9 +157,14 @@ def ego_from_dgl(graph, labels, label_type, hops, max_nodes=None, backend="auto"
     )
 
 
+def size_cap(dataset: str, no_cap: bool = False):
+    """Released code: T-Finance drops ego-graphs with more than 1200 nodes. no_cap keeps them (tag _nocap)."""
+    return 1200 if dataset == "tfinance" and not no_cap else None
+
+
 def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
           bidirectional: bool = False, drop_unlabelled: bool = False, hops: int | None = None,
-          users_only: bool = False) -> list[nx.Graph]:
+          users_only: bool = False, no_cap: bool = False) -> list[nx.Graph]:
     logger.info(f"dataset={dataset} label_type={label_type}")
 
     if dataset in FULL_GRAPH_HOPS:
@@ -167,7 +172,7 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
         if drop_unlabelled:
             graph, labels = labelled_subgraph(graph, labels)
         return ego_from_dgl(graph, labels, label_type, hops=hops or FULL_GRAPH_HOPS[dataset],
-                            max_nodes=1200 if dataset == "tfinance" else None, backend=backend,
+                            max_nodes=size_cap(dataset, no_cap), backend=backend,
                             bidirectional=bidirectional, centers_below=USER_NODES[dataset] if users_only else None)
 
     if dataset == "elliptic":
@@ -202,7 +207,7 @@ def build(dataset: str, label_type: str, backend: str = "auto", elliptic_full: b
 
 def build_lean_only(dataset: str, label_type: str, backend: str = "auto", drop_unlabelled: bool = False,
                     node_time: bool = False, hops: int | None = None, bidirectional: bool = False,
-                    users_only: bool = False) -> None:
+                    users_only: bool = False, no_cap: bool = False) -> None:
     """Write the detector's lean tensors (data/cache/<name>.lean.pt) directly, without the networkx pickle.
     Same ego-graphs, order and file name stem as initOriginDataset; datasets loaded as one static graph only."""
     from baed.graph_ops import build_ego_lean
@@ -216,7 +221,7 @@ def build_lean_only(dataset: str, label_type: str, backend: str = "auto", drop_u
     below = USER_NODES[dataset] if users_only else None
     items, centers = build_ego_lean(src.numpy(), dst.numpy(), graph.num_nodes(), graph.ndata["feature"],
                                     select_centers(labels, label_type, below), hops or FULL_GRAPH_HOPS[dataset], labels,
-                                    max_nodes=1200 if dataset == "tfinance" else None, backend=backend,
+                                    max_nodes=size_cap(dataset, no_cap), backend=backend,
                                     bidirectional=bidirectional, return_centers=True)
     if node_time:
         # centers of the KEPT ego-graphs (T-Finance drops those > 1200 nodes): pairing the items with all selected
@@ -226,7 +231,7 @@ def build_lean_only(dataset: str, label_type: str, backend: str = "auto", drop_u
         order = sorted(range(len(items)), key=lambda i: t[int(centers[i])])  # stable: ties keep center order
         items = [items[i] for i in order]
     tag = ("_lab" if drop_unlabelled else "") + ("_t" if node_time else "") + ("_bi" if bidirectional else "")
-    tag += (f"_h{hops}" if hops else "") + ("_u" if users_only else "")
+    tag += (f"_h{hops}" if hops else "") + ("_u" if users_only else "") + ("_nocap" if no_cap else "")
     stem = output_file(dataset, label_type, tag=tag).stem
     out = paths.ensure(paths.root() / "data" / "cache" / f"{stem}.lean.pt")
     torch.save(items, out)
@@ -237,11 +242,11 @@ def build_lean_only(dataset: str, label_type: str, backend: str = "auto", drop_u
 
 def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elliptic_full: bool = False,
                       bidirectional: bool = False, drop_unlabelled: bool = False, node_time: bool = False,
-                      hops: int | None = None, users_only: bool = False) -> None:
+                      hops: int | None = None, users_only: bool = False, no_cap: bool = False) -> None:
     """Build and save one ego-graph dataset (name kept from the original code)."""
     t0 = time.time()
     nx_graphs = build(dataset, label_type, backend=backend, elliptic_full=elliptic_full, bidirectional=bidirectional,
-                      drop_unlabelled=drop_unlabelled, hops=hops, users_only=users_only)
+                      drop_unlabelled=drop_unlabelled, hops=hops, users_only=users_only, no_cap=no_cap)
     if node_time:
         # order the ego-graphs by the appearance time of their center (stable), so the sequential 70/15/15 split
         # of the detector is a temporal split, as on Elliptic
@@ -249,7 +254,7 @@ def initOriginDataset(dataset: str, label_type: str, backend: str = "auto", elli
         nx_graphs = [g for _, g in sorted(((t[next(iter(g.nodes))], g) for g in nx_graphs), key=lambda p: p[0])]
         logger.info(f"ego-graphs ordered by center time ({dataset}_node_time.npy)")
     tag = ("_full" if elliptic_full else "") + ("_lab" if drop_unlabelled else "") + ("_t" if node_time else "") + ("_bi" if bidirectional else "")
-    tag += (f"_h{hops}" if hops else "") + ("_u" if users_only else "")
+    tag += (f"_h{hops}" if hops else "") + ("_u" if users_only else "") + ("_nocap" if no_cap else "")
     out = output_file(dataset, label_type, tag=tag)
     with open(out, "wb") as f:
         pkl.dump(nx_graphs, f)
@@ -281,20 +286,23 @@ def main(argv=None):
     parser.add_argument("--lean-only", action="store_true",
                         help="write only the detector's lean tensors (data/cache/<name>.lean.pt), no networkx pickle "
                              "(minutes instead of hours for large ego-graphs; the diffusion still needs the pickle)")
+    parser.add_argument("--no-cap", action="store_true",
+                        help="T-Finance: keep the ego-graphs larger than 1200 nodes that the released code drops; adds "
+                             "_nocap to the file name")
     args = parser.parse_args(argv)
     for dataset in args.dataset:
         for label_type in args.label_type:
             if args.lean_only:
                 build_lean_only(dataset, label_type, backend=args.backend, drop_unlabelled=args.drop_unlabelled,
                                 node_time=args.node_time, hops=args.hops, bidirectional=args.bidirectional,
-                                users_only=args.users_only and dataset in USER_NODES)
+                                users_only=args.users_only and dataset in USER_NODES, no_cap=args.no_cap)
                 continue
             initOriginDataset(dataset, label_type, backend=args.backend,
                               elliptic_full=args.elliptic_full and dataset == "elliptic",
                               bidirectional=args.bidirectional,
                               drop_unlabelled=args.drop_unlabelled and dataset != "elliptic",
                               node_time=args.node_time and dataset != "elliptic", hops=args.hops,
-                              users_only=args.users_only and dataset in USER_NODES)
+                              users_only=args.users_only and dataset in USER_NODES, no_cap=args.no_cap)
 
 
 if __name__ == "__main__":
